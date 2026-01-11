@@ -1,9 +1,9 @@
-"use client";
+﻿"use client";
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { getBrowserSupabase } from "../lib/supabase/browserClient";
+import { getBrowserSupabase } from "@/lib/supabase/browserClient";
 
 export default function ShellHeader() {
   const pathname = usePathname();

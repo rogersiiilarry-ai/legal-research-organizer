@@ -1,8 +1,8 @@
-"use client";
+﻿"use client";
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { getBrowserSupabase } from "../../lib/supabase/browserClient";
+import { getBrowserSupabase } from "@/lib/supabase/browserClient";
 
 export default function SignUp() {
   const [email, setEmail] = useState("");

@@ -1,8 +1,8 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { getBrowserSupabase } from "../../../lib/supabase/browserClient";
+import { getBrowserSupabase } from "@/lib/supabase/browserClient";
 
 export default function ListPage() {
   const [rows, setRows] = useState([]);

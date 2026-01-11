@@ -1,8 +1,8 @@
-"use client";
+﻿"use client";
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { getBrowserSupabase } from "../../lib/supabase/browserClient";
+import { getBrowserSupabase } from "@/lib/supabase/browserClient";
 
 export default function Logout() {
   const router = useRouter();
