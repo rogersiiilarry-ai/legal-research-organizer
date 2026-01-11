@@ -1,7 +1,13 @@
-// frontend/app/app/layout.tsx
+// frontend/app/layout.tsx
+import "./globals.css";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export default function AppLayout({ children }: { children: React.ReactNode }) {
-  return children;
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  );
 }
