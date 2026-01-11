@@ -24,3 +24,5 @@ frontend/payload.json
 frontend/resp.json
 frontend/run.json
 
+.vercel
+.env*.local
