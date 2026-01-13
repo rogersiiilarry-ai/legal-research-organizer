@@ -1,17 +1,20 @@
-﻿// frontend/app/api/documents/[id]/materialize/route.ts
+// frontend/app/api/documents/[id]/materialize/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
-import { createRequire } from "module";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 /* ------------------------------- helpers ------------------------------- */
 
 function json(status: number, payload: any) {
-  return NextResponse.json(payload, { status });
+  return NextResponse.json(payload, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 function mustEnv(name: string) {
@@ -24,8 +27,16 @@ function asInt(v: any, fallback: number) {
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
 }
+
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
+}
+
+function safeStr(v: any, max = 4000) {
+  if (typeof v !== "string") return "";
+  const t = v.trim();
+  if (!t) return "";
+  return t.length > max ? t.slice(0, max) : t;
 }
 
 function normalizeText(input: string) {
@@ -69,9 +80,7 @@ function chunkText(text: string, maxChars: number) {
 }
 
 function isUuid(v: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    v || ""
-  );
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v || "");
 }
 
 function isHttpUrl(v: string) {
@@ -80,7 +89,19 @@ function isHttpUrl(v: string) {
 
 /* -------------------------------- auth -------------------------------- */
 
-async function requireUser() {
+type Auth =
+  | { ok: true; mode: "system"; userId: null }
+  | { ok: true; mode: "user"; userId: string }
+  | { ok: false; status: number; error: string };
+
+async function requireSystemOrUser(req: Request): Promise<Auth> {
+  const provided = req.headers.get("x-ingest-secret") || "";
+  const expected = process.env.INGEST_SECRET || "";
+
+  if (expected && provided && provided === expected) {
+    return { ok: true, mode: "system", userId: null };
+  }
+
   const cookieStore = cookies();
   const supabaseAuth = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
@@ -97,8 +118,8 @@ async function requireUser() {
   );
 
   const { data, error } = await supabaseAuth.auth.getUser();
-  if (error || !data?.user?.id) return { ok: false as const, status: 401, error: "Unauthorized" };
-  return { ok: true as const, userId: data.user.id };
+  if (error || !data?.user?.id) return { ok: false, status: 401, error: "Unauthorized" };
+  return { ok: true, mode: "user", userId: data.user.id };
 }
 
 function dbAdmin() {
@@ -109,36 +130,87 @@ function dbAdmin() {
   );
 }
 
-/* ------------------------ document lookup (REAL FIX) ------------------------ */
+/* ------------------------ document lookup ------------------------ */
 /**
  * [id] can be:
  *  - documents.id (uuid)
- *  - documents.external_id (like "url:....")
+ *  - documents.external_id (url:..., storage:..., etc)
  */
 async function loadDocumentByIdOrExternalId(admin: any, token: string) {
   const sel = "id, owner_id, raw, title, external_id";
   const t = String(token || "").trim();
   if (!t) return { doc: null as any, error: "Missing document identifier" };
 
-  // UUID -> documents.id
   if (isUuid(t)) {
     const r = await admin.from("documents").select(sel).eq("id", t).maybeSingle();
     if (r.error) return { doc: null as any, error: r.error.message };
     if (r.data) return { doc: r.data, error: null as any };
   }
 
-  // Otherwise treat as external_id
-  const r = await admin.from("documents").select(sel).eq("external_id", t).maybeSingle();
-  if (r.error) return { doc: null as any, error: r.error.message };
-  return { doc: r.data || null, error: null as any };
+  const r2 = await admin.from("documents").select(sel).eq("external_id", t).maybeSingle();
+  if (r2.error) return { doc: null as any, error: r2.error.message };
+  return { doc: r2.data || null, error: null as any };
 }
 
-/* --------------------------- PDF fetch + parse --------------------------- */
+/* ---------------------- resolve PDF source ---------------------- */
 
-async function fetchBinaryPdf(url: string, timeoutMs: number) {
-  if (!isHttpUrl(url)) {
-    throw new Error(`Resolved PDF value is not an http(s) URL: ${url}`);
+type ResolvedPdf =
+  | { kind: "http"; url: string; resolvedFrom: string }
+  | { kind: "storage"; bucket: string; path: string; resolvedFrom: string };
+
+function pickPdfCandidate(raw: any): string {
+  const cands = [raw?.pdf_url, raw?.pdfUrl, raw?.pdf, raw?.url]
+    .map((x) => (typeof x === "string" ? x.trim() : ""))
+    .filter(Boolean);
+
+  for (const c of cands) if (isHttpUrl(c)) return c;
+  return cands[0] || "";
+}
+
+async function resolvePdfSource(admin: any, doc: any): Promise<ResolvedPdf> {
+  const raw = doc?.raw || {};
+
+  // 1) uploads: raw.storage_bucket + raw.storage_path
+  const bucket = safeStr(raw?.storage_bucket || raw?.storageBucket, 128);
+  const path = safeStr(raw?.storage_path || raw?.storagePath, 1200);
+  if (bucket && path) {
+    return { kind: "storage", bucket, path, resolvedFrom: "documents.raw.storage_*" };
   }
+
+  // 2) external URL in raw.pdf_url/pdf/url
+  const first = pickPdfCandidate(raw);
+  if (isHttpUrl(first)) return { kind: "http", url: first, resolvedFrom: "documents.raw.*url" };
+
+  // 3) allow pointer to another documents row by UUID (legacy)
+  if (isUuid(first)) {
+    const r = await admin.from("documents").select("id, raw").eq("id", first).maybeSingle();
+    if (r.error) throw new Error(`PDF pointer lookup failed: ${r.error.message}`);
+    if (!r.data) throw new Error(`PDF pointer document not found: ${first}`);
+
+    const refRaw = r.data.raw || {};
+    const b2 = safeStr(refRaw?.storage_bucket || refRaw?.storageBucket, 128);
+    const p2 = safeStr(refRaw?.storage_path || refRaw?.storagePath, 1200);
+    if (b2 && p2) {
+      return { kind: "storage", bucket: b2, path: p2, resolvedFrom: "pointer:documents.id -> raw.storage_*" };
+    }
+
+    const refFirst = pickPdfCandidate(refRaw);
+    if (isHttpUrl(refFirst)) {
+      return { kind: "http", url: refFirst, resolvedFrom: "pointer:documents.id -> raw.*url" };
+    }
+
+    throw new Error(`PDF pointer resolved, but no usable source found (storage_* or http url).`);
+  }
+
+  throw new Error(
+    `Document has no usable PDF source. Expected raw.pdf_url (http) OR raw.storage_bucket+raw.storage_path.`
+  );
+}
+
+/* --------------------------- fetch bytes --------------------------- */
+
+async function fetchBinaryPdfHttp(url: string, timeoutMs: number) {
+  if (!isHttpUrl(url)) throw new Error(`Resolved PDF value is not an http(s) URL: ${url}`);
 
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs);
@@ -160,7 +232,6 @@ async function fetchBinaryPdf(url: string, timeoutMs: number) {
     const ab = await res.arrayBuffer();
     const buf = Buffer.from(ab);
 
-    // ONLY enforce "is PDF" by signature, not content-type
     const prefix = buf.slice(0, 5).toString("utf8");
     if (prefix !== "%PDF-") {
       const head = buf.slice(0, 160).toString("utf8").replace(/\s+/g, " ").trim();
@@ -171,52 +242,28 @@ async function fetchBinaryPdf(url: string, timeoutMs: number) {
   } finally {
     clearTimeout(t);
   }
-}
-/* ---------------------- resolve PDF URL from document ---------------------- */
-
-function pickPdfCandidate(raw: any): string {
-  const cands = [raw?.pdf, raw?.pdf_url, raw?.pdfUrl, raw?.url]
-    .map((x) => (typeof x === "string" ? x.trim() : ""))
-    .filter(Boolean);
-
-  // prefer real URL
-  for (const c of cands) if (isHttpUrl(c)) return c;
-
-  // else return first token (might be pointer)
-  return cands[0] || "";
 }
 
-async function resolvePdfUrl(admin: any, doc: any) {
-  const raw = doc?.raw || {};
-  const first = pickPdfCandidate(raw);
+async function fetchBinaryPdfFromStorage(admin: any, bucket: string, path: string) {
+  // Service role can download from private bucket
+  const dl = await admin.storage.from(bucket).download(path);
+  if (dl.error) throw new Error(`Storage download failed: ${dl.error.message}`);
 
-  if (isHttpUrl(first)) return { pdfUrl: first, resolvedFrom: "self:url" as const };
+  const ab = await dl.data.arrayBuffer();
+  const buf = Buffer.from(ab);
 
-  // If raw.pdf is a UUID pointer to another documents row
-  if (isUuid(first)) {
-    const r = await admin.from("documents").select("id, raw").eq("id", first).maybeSingle();
-    if (r.error) throw new Error(`PDF pointer lookup failed: ${r.error.message}`);
-    if (!r.data) throw new Error(`PDF pointer document not found: ${first}`);
-
-    const refFirst = pickPdfCandidate(r.data.raw || {});
-    if (!isHttpUrl(refFirst)) throw new Error(`PDF pointer resolved, but still not a URL: ${refFirst || "(empty)"}`);
-
-    return { pdfUrl: refFirst, resolvedFrom: "pointer:documents.id" as const };
+  const prefix = buf.slice(0, 5).toString("utf8");
+  if (prefix !== "%PDF-") {
+    const head = buf.slice(0, 160).toString("utf8").replace(/\s+/g, " ").trim();
+    throw new Error(`Storage content is not a PDF (missing %PDF-). First bytes: "${head}"`);
   }
 
-  throw new Error(
-    `Document has no usable PDF URL. Expected raw.pdf/raw.pdf_url to be an http(s) URL, got: ${first || "(empty)"}`
-  );
+  return buf;
 }
 
-/* ---------------------------------- route ---------------------------------- */
-/* --------------------------- pdfjs text extraction helper --------------------------- */
-/**
- * Extracts text from a PDF using pdfjs-dist legacy build (server-side).
- * Returns a single concatenated string (pages separated by blank lines).
- */
+/* ---------------------- pdfjs text extraction helper ---------------------- */
+
 async function extractPdfText(pdfBytes: Uint8Array): Promise<string> {
-  // In Node (Next.js route handlers), pdfjs works without setting workerSrc.
   // @ts-ignore
   const loadingTask = pdfjs.getDocument({ data: pdfBytes });
   // @ts-ignore
@@ -238,18 +285,19 @@ async function extractPdfText(pdfBytes: Uint8Array): Promise<string> {
 
   return out;
 }
+
+/* ---------------------------------- route ---------------------------------- */
+
 export async function POST(req: Request, ctx: { params: { id: string } }) {
   try {
-    const auth = await requireUser();
+    const auth = await requireSystemOrUser(req);
     if (!auth.ok) return json(auth.status, { ok: false, error: auth.error });
 
     const admin = dbAdmin();
 
-    // IMPORTANT: This is the [id] segment from the URL.
-    // It may be UUID or external_id (like url:xxxx)
     const token = String(ctx?.params?.id || "").trim();
-
     const body = await req.json().catch(() => ({}));
+
     const materializeCfg = body?.materialize || {};
     const chunkMaxChars = clamp(asInt(materializeCfg?.maxChars, 4000), 800, 12000);
     const maxChunks = clamp(asInt(materializeCfg?.maxChunks, 250), 1, 2000);
@@ -259,26 +307,32 @@ export async function POST(req: Request, ctx: { params: { id: string } }) {
     if (loadErr) return json(500, { ok: false, phase: "load_document", error: loadErr });
     if (!doc) return json(404, { ok: false, phase: "load_document", error: "Document not found", identifier: token });
 
-    if (doc.owner_id && doc.owner_id !== auth.userId) {
+    // Owner check for real users (system bypass)
+    if (auth.mode === "user" && doc.owner_id && doc.owner_id !== auth.userId) {
       return json(403, { ok: false, phase: "authz", error: "Forbidden" });
     }
 
-    const resolved = await resolvePdfUrl(admin, doc);
-    const pdfUrl = resolved.pdfUrl;
-
-    const pdfBuf = await fetchBinaryPdf(pdfUrl, timeoutMs);
+    const resolved = await resolvePdfSource(admin, doc);
 
     const maxBytes = 25 * 1024 * 1024;
+
+    let pdfBuf: Buffer;
+    if (resolved.kind === "http") {
+      pdfBuf = await fetchBinaryPdfHttp(resolved.url, timeoutMs);
+    } else {
+      pdfBuf = await fetchBinaryPdfFromStorage(admin, resolved.bucket, resolved.path);
+    }
+
     if (pdfBuf.length > maxBytes) {
       return json(413, { ok: false, phase: "pdf_size", error: `PDF too large (${pdfBuf.length} bytes)` });
     }
+
     const extracted = await extractPdfText(pdfBuf);
     const text = normalizeText(extracted || "");
     if (!text) return json(422, { ok: false, phase: "parse_pdf", error: "Parsed but no text extracted" });
 
     const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
 
-    // Replace chunks for the REAL UUID document_id
     const documentId = String(doc.id);
 
     const del = await admin.from("chunks").delete().eq("document_id", documentId);
@@ -296,7 +350,10 @@ export async function POST(req: Request, ctx: { params: { id: string } }) {
       ok: true,
       document_id: documentId,
       document_identifier: token,
-      pdf_url: pdfUrl,
+      pdf_source:
+        resolved.kind === "http"
+          ? { kind: "http", url: resolved.url }
+          : { kind: "storage", bucket: resolved.bucket, path: resolved.path },
       pdf_resolved_from: resolved.resolvedFrom,
       chunk_count: rows.length,
     });
@@ -304,9 +361,3 @@ export async function POST(req: Request, ctx: { params: { id: string } }) {
     return json(500, { ok: false, phase: "exception", error: e?.message || String(e) });
   }
 }
-
-
-
-
-
-
