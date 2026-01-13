@@ -1,6 +1,8 @@
 ﻿import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
+/* ----------------------------- path helpers ----------------------------- */
+
 function isPublicPath(pathname) {
   return (
     pathname === "/" ||
@@ -12,6 +14,7 @@ function isPublicPath(pathname) {
 }
 
 function isPublicApi(pathname) {
+  // No auth at all
   return pathname === "/api/health" || pathname.startsWith("/api/auth/");
 }
 
@@ -19,47 +22,73 @@ function isIngestPath(pathname) {
   return pathname.startsWith("/api/ingest/");
 }
 
+function isSystemAllowedApi(pathname) {
+  // Internal system calls authenticated via x-ingest-secret
+  return pathname === "/api/search" || pathname.startsWith("/api/resolve") || pathname.startsWith("/api/audit/run/materialize") || (pathname.startsWith("/api/documents/") && pathname.endsWith("/materialize"));}
+
 function isProtectedApi(pathname) {
-  // everything under /api is protected except health + api/auth/*
-  return pathname.startsWith("/api/") && !isPublicApi(pathname) && !isIngestPath(pathname);
+  // Everything under /api except explicit exclusions
+  return (
+    pathname.startsWith("/api/") &&
+    !isPublicApi(pathname) &&
+    !isIngestPath(pathname) &&
+    !isSystemAllowedApi(pathname)
+  );
 }
 
 function isProtectedApp(pathname) {
   return (
-    pathname === "/app" || pathname.startsWith("/app/") ||
-    pathname === "/integrations" || pathname.startsWith("/integrations/") ||
-    pathname === "/settings" || pathname.startsWith("/settings/")
+    pathname === "/app" ||
+    pathname.startsWith("/app/") ||
+    pathname === "/integrations" ||
+    pathname.startsWith("/integrations/") ||
+    pathname === "/settings" ||
+    pathname.startsWith("/settings/")
   );
 }
+
+/* ------------------------------- middleware ------------------------------ */
 
 export async function middleware(req) {
   const { pathname } = req.nextUrl;
 
-  // Always allow public static/app routes
+  // Always allow public paths
   if (isPublicPath(pathname)) return NextResponse.next();
 
-  // Public API routes (no auth)
+  // Public APIs
   if (isPublicApi(pathname)) return NextResponse.next();
 
   // Always allow preflight
   if (req.method === "OPTIONS") return NextResponse.next();
 
-  // Ingest routes: header-based auth only (no cookie session required)
+  // Ingest routes: header-based auth only
   if (isIngestPath(pathname)) {
     const provided = req.headers.get("x-ingest-secret") || "";
     const expected = process.env.INGEST_SECRET || "";
+
     if (!expected || provided !== expected) {
       return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
     }
     return NextResponse.next();
   }
 
-  // Only protect these app paths and all other /api/*
-  if (!isProtectedApp(pathname) && !isProtectedApi(pathname)) {
+  // System-allowed APIs: also header-based auth
+  if (isSystemAllowedApi(pathname)) {
+    const provided = req.headers.get("x-ingest-secret") || "";
+    const expected = process.env.INGEST_SECRET || "";
+
+    if (!expected || provided !== expected) {
+      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
     return NextResponse.next();
   }
 
-  // Supabase session check
+  // If not protected, allow
+  if (!isProtectedApi(pathname) && !isProtectedApp(pathname)) {
+    return NextResponse.next();
+  }
+
+  // Supabase session auth
   const res = NextResponse.next();
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -80,11 +109,12 @@ export async function middleware(req) {
   );
 
   const { data } = await supabase.auth.getUser();
+
   if (!data?.user) {
-    // For API routes, return 401 JSON. For app routes, redirect to /login.
     if (pathname.startsWith("/api/")) {
       return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
     }
+
     const url = req.nextUrl.clone();
     url.pathname = "/login";
     url.searchParams.set("next", pathname);
@@ -97,3 +127,4 @@ export async function middleware(req) {
 export const config = {
   matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
+
