@@ -1,10 +1,66 @@
-﻿// frontend/middleware.js
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
-function getSupabase(req) {
-  const res = NextResponse.next();
+function isPublicPath(pathname) {
+  return (
+    pathname === "/" ||
+    pathname === "/login" ||
+    pathname === "/signup" ||
+    pathname.startsWith("/_next/") ||
+    pathname === "/favicon.ico"
+  );
+}
 
+function isPublicApi(pathname) {
+  return pathname === "/api/health" || pathname.startsWith("/api/auth/");
+}
+
+function isIngestPath(pathname) {
+  return pathname.startsWith("/api/ingest/");
+}
+
+function isProtectedApi(pathname) {
+  // everything under /api is protected except health + api/auth/*
+  return pathname.startsWith("/api/") && !isPublicApi(pathname) && !isIngestPath(pathname);
+}
+
+function isProtectedApp(pathname) {
+  return (
+    pathname === "/app" || pathname.startsWith("/app/") ||
+    pathname === "/integrations" || pathname.startsWith("/integrations/") ||
+    pathname === "/settings" || pathname.startsWith("/settings/")
+  );
+}
+
+export async function middleware(req) {
+  const { pathname } = req.nextUrl;
+
+  // Always allow public static/app routes
+  if (isPublicPath(pathname)) return NextResponse.next();
+
+  // Public API routes (no auth)
+  if (isPublicApi(pathname)) return NextResponse.next();
+
+  // Always allow preflight
+  if (req.method === "OPTIONS") return NextResponse.next();
+
+  // Ingest routes: header-based auth only (no cookie session required)
+  if (isIngestPath(pathname)) {
+    const provided = req.headers.get("x-ingest-secret") || "";
+    const expected = process.env.INGEST_SECRET || "";
+    if (!expected || provided !== expected) {
+      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
+    return NextResponse.next();
+  }
+
+  // Only protect these app paths and all other /api/*
+  if (!isProtectedApp(pathname) && !isProtectedApi(pathname)) {
+    return NextResponse.next();
+  }
+
+  // Supabase session check
+  const res = NextResponse.next();
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
@@ -17,112 +73,18 @@ function getSupabase(req) {
           res.cookies.set({ name, value, ...options });
         },
         remove(name, options) {
-          res.cookies.set({ name, value: "", ...options, maxAge: 0 });
+          res.cookies.set({ name, value: "", ...options });
         },
       },
     }
   );
 
-  return { supabase, res };
-}
-
-export async function middleware(req) {
-  const { pathname } = req.nextUrl;
-
-// Public API routes (no auth)
-if (pathname === "/api/health") return NextResponse.next();
-if (pathname.startsWith("/api/auth/")) return NextResponse.next();
-if (pathname.startsWith("/api/ingest/")) return NextResponse.next();
-
-// Public API routes (no auth)
-if (pathname === "/api/health") return NextResponse.next();
-if (pathname.startsWith("/api/auth/")) return NextResponse.next();
-if (pathname.startsWith("/api/ingest/")) return NextResponse.next();
-
-  // Always allow preflight
-  if (req.method === "OPTIONS") return NextResponse.next();
-
-  // Always allow Next internals + common static
-  if (
-    pathname.startsWith("/_next") ||
-    pathname === "/favicon.ico" ||
-    pathname === "/robots.txt" ||
-    pathname === "/sitemap.xml" ||
-    pathname === "/manifest.json"
-  ) {
-    return NextResponse.next();
-  }
-
-  // Public pages
-  const publicPaths = ["/", "/login", "/signup"];
-  if (publicPaths.includes(pathname)) return NextResponse.next();
-
-  // ------------------------------------------------------------
-  // PUBLIC AUTH PATHS (must be accessible before login)
-  // ------------------------------------------------------------
-  // Supabase can use /auth/v1/* and you may have /api/auth/*
-  // Also allow auth callbacks if you route them through /auth/*
-  if (
-    pathname.startsWith("/auth/") ||          // supabase hosted/auth callback paths
-    pathname.startsWith("/api/auth/")        // your next api auth routes (if any)
-  ) {
-    return NextResponse.next();
-  }
-
-  // ------------------------------------------------------------
-  // ADMIN ROUTES (header-based auth; no cookie session required)
-  // ------------------------------------------------------------
-  if (pathname.startsWith("/api/admin/")) {
-    const provided = req.headers.get("x-admin-secret") || "";
-    const expected = process.env.ADMIN_SECRET || "";
-
-    if (!expected) {
-      return NextResponse.json(
-        { ok: false, error: "Server misconfigured: ADMIN_SECRET is not set" },
-        { status: 500 }
-      );
-    }
-
-    if (provided !== expected) {
-      return NextResponse.json({ ok: false, error: "Unauthorized (admin)" }, { status: 401 });
-    }
-
-    return NextResponse.next();
-  }
-
-  // ------------------------------------------------------------
-  // INGEST ROUTES (header-based auth; no cookie session required)
-  // ------------------------------------------------------------
-  if (pathname.startsWith("/api/ingest/")) {
-    const provided = req.headers.get("x-ingest-secret") || "";
-    const expected = process.env.INGEST_SECRET || "";
-
-    if (expected && provided === expected) return NextResponse.next();
-
-    return NextResponse.json({ ok: false, error: "Unauthorized (ingest)" }, { status: 401 });
-  }
-
-  // ------------------------------------------------------------
-  // Everything else under /api requires a logged-in user session
-  // ------------------------------------------------------------
-  if (pathname.startsWith("/api/")) {
-    const { supabase, res } = getSupabase(req);
-    const { data } = await supabase.auth.getUser();
-
-    if (!data?.user) {
+  const { data } = await supabase.auth.getUser();
+  if (!data?.user) {
+    // For API routes, return 401 JSON. For app routes, redirect to /login.
+    if (pathname.startsWith("/api/")) {
       return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
     }
-
-    return res;
-  }
-
-  // ------------------------------------------------------------
-  // Pages: require logged-in session
-  // ------------------------------------------------------------
-  const { supabase, res } = getSupabase(req);
-  const { data } = await supabase.auth.getUser();
-
-  if (!data?.user) {
     const url = req.nextUrl.clone();
     url.pathname = "/login";
     url.searchParams.set("next", pathname);
@@ -135,6 +97,3 @@ if (pathname.startsWith("/api/ingest/")) return NextResponse.next();
 export const config = {
   matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
-
-
-
