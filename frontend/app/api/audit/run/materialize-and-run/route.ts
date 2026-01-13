@@ -94,10 +94,12 @@ async function requireSystemOrUser(req: Request): Promise<AuthResult> {
   const provided = req.headers.get("x-ingest-secret") || "";
   const expected = process.env.INGEST_SECRET || "";
 
+  // System secret bypass (internal automation only)
   if (expected && provided && provided === expected) {
     return { ok: true, mode: "system", userId: null };
   }
 
+  // User cookie auth (browser)
   const cookieStore = cookies();
   const supabaseAuth = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
@@ -121,38 +123,38 @@ async function requireSystemOrUser(req: Request): Promise<AuthResult> {
 
 /* --------------------------- stripe + entitlement --------------------------- */
 /**
- * For now, treat "not entitled" as "always require purchase" unless you already
- * have a paid flag in Supabase to check.
+ * TODO: Wire this to real entitlements (recommended):
+ * - payments table
+ * - or user profile flag
+ * - or analyses credits ledger
  *
- * Hook this up later to your own entitlement table (recommended).
+ * For now: always false => always paywalled for user mode.
  */
 async function isEntitled(_supabase: any, _userId: string, _withPdf: boolean): Promise<boolean> {
   return false;
 }
 
-function siteOriginFromEnv(req: Request) {
-  const env =
-    process.env.NEXT_PUBLIC_SITE_URL ||
-    process.env.VERCEL_URL ||
-    new URL(req.url).origin;
+function siteOrigin(req: Request) {
+  const env = process.env.NEXT_PUBLIC_SITE_URL;
+  if (env && env.trim()) return env.trim();
 
-  return env.startsWith("http") ? env : `https://${env}`;
+  // VERCEL_URL is host-only, not a full origin
+  const host = process.env.VERCEL_URL;
+  if (host && host.trim()) return `https://${host.trim()}`;
+
+  return new URL(req.url).origin;
 }
 
 function pickPrice(withPdf: boolean) {
-  // Your stated pricing:
-  // - $50 without PDF => BASIC
-  // - $100 with PDF => PRO
   return withPdf ? mustEnv("STRIPE_PRICE_PRO") : mustEnv("STRIPE_PRICE_BASIC");
 }
 
 async function createCheckout(origin: string, withPdf: boolean, userId: string, documentId: string) {
-  const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), {
-    apiVersion: "2023-10-16",
-  });
+  const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), { apiVersion: "2025-12-15.clover" });
 
   const price = pickPrice(withPdf);
 
+  // Keep this simple for now. You can swap these to a dedicated /checkout/success route later.
   const success_url = `${origin}/app?checkout=success&doc=${encodeURIComponent(documentId)}`;
   const cancel_url = `${origin}/pricing?checkout=cancel`;
 
@@ -173,6 +175,12 @@ async function createCheckout(origin: string, withPdf: boolean, userId: string, 
   return session.url || null;
 }
 
+function wantsHtmlRedirect(req: Request) {
+  const accept = req.headers.get("accept") || "";
+  // Browsers typically send text/html in accept for navigations
+  return accept.includes("text/html");
+}
+
 /* ------------------------ document lookup + pdf resolve ------------------------ */
 
 function normalizeExternalId(token: string) {
@@ -190,12 +198,14 @@ async function loadDocumentByIdOrExternalId(supabase: any, token: string) {
 
   const sel = "id, owner_id, raw, title, external_id";
 
+  // 1) UUID => documents.id
   if (isUuid(id)) {
     const r = await supabase.from("documents").select(sel).eq("id", id).maybeSingle();
     if (r.error) return { doc: null as any, error: r.error.message };
     if (r.data) return { doc: r.data, error: null as any };
   }
 
+  // 2) external_id
   const ext = normalizeExternalId(id);
   const r2 = await supabase.from("documents").select(sel).eq("external_id", ext).maybeSingle();
   if (r2.error) return { doc: null as any, error: r2.error.message };
@@ -217,7 +227,7 @@ function pickPdfCandidate(raw: any): string | null {
   return direct ? String(direct).trim() : null;
 }
 
-async function resolvePdfUrl(supabase: any, doc: any): Promise<{ pdfUrl: string | null; source: string }> {
+async function resolvePdfUrl(_supabase: any, doc: any): Promise<{ pdfUrl: string | null; source: string }> {
   const direct =
     (typeof doc?.pdf_url === "string" && doc.pdf_url) ||
     (typeof doc?.pdfUrl === "string" && doc.pdfUrl) ||
@@ -278,7 +288,8 @@ function runDeterministicAudit(text: string, maxFindings: number) {
     findings.push({
       title: "Key terms detected",
       severity: "info",
-      claim: "The record contains one or more high-signal legal procedure terms. This is a keyword-level observation for research.",
+      claim:
+        "The record contains one or more high-signal legal procedure terms. This is a keyword-level observation for research.",
       evidence: [{ bullets: flags.map((s) => `• ${s}`) }],
     });
   }
@@ -338,14 +349,18 @@ export async function POST(req: Request) {
     // PAYWALL: only for real users (system is internal automation)
     if (auth.mode === "user") {
       const entitled = await isEntitled(supabase, auth.userId, withPdf);
+
       if (!entitled) {
-        const origin = siteOriginFromEnv(req);
+        const origin = siteOrigin(req);
         const checkoutUrl = await createCheckout(origin, withPdf, auth.userId, documentId);
 
         if (!checkoutUrl) return json(500, { ok: false, phase: "stripe", error: "Failed to create checkout session" });
 
-        // 303 redirect for browsers + JSON fallback
-        return NextResponse.redirect(checkoutUrl, 303);
+        // Browser navigation => redirect
+        if (wantsHtmlRedirect(req)) return NextResponse.redirect(checkoutUrl, 303);
+
+        // Non-browser caller => return URL
+        return json(402, { ok: false, phase: "stripe", error: "Payment required", checkout_url: checkoutUrl });
       }
     }
 
@@ -357,7 +372,6 @@ export async function POST(req: Request) {
 
     const resolved = await resolvePdfUrl(supabase, doc);
     const pdfUrl = resolved.pdfUrl;
-
     if (!pdfUrl) return json(400, { ok: false, phase: "resolve_pdf_url", error: "No PDF URL resolved for document" });
 
     const owner_id = auth.mode === "user" ? auth.userId : mustEnv("SYSTEM_OWNER_ID").trim();
@@ -386,7 +400,7 @@ export async function POST(req: Request) {
 
     const analysisId = String(created.id);
 
-    const origin = siteOriginFromEnv(req);
+    const origin = siteOrigin(req);
     const ingestSecret = process.env.INGEST_SECRET || "";
     if (!ingestSecret) throw new Error("Missing INGEST_SECRET for internal materialize call");
 
@@ -402,7 +416,11 @@ export async function POST(req: Request) {
 
     const text = normalizeText((chunksRes.data || []).map((r: any) => String(r.content || "")).join("\n\n"));
     if (!text) {
-      await supabase.from("analyses").update({ status: "error", error: "Materialized but no text extracted" }).eq("id", analysisId);
+      await supabase
+        .from("analyses")
+        .update({ status: "error", error: "Materialized but no text extracted" })
+        .eq("id", analysisId);
+
       return json(422, { ok: false, phase: "materialize", error: "Materialized but no text extracted", analysisId });
     }
 
