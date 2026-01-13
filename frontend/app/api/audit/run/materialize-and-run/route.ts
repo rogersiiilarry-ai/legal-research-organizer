@@ -1,4 +1,9 @@
-﻿// frontend/app/api/audit/run/materialize-and-run/route.ts
+﻿import Stripe from "stripe";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2023-10-16",
+});
+// frontend/app/api/audit/run/materialize-and-run/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
@@ -558,6 +563,7 @@ const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
     return json(500, { ok: false, phase: "exception", error: e?.message || String(e) });
   }
 }
+
 
 
 
