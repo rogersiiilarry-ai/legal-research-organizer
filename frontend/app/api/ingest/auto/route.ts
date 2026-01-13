@@ -1,4 +1,4 @@
-// frontend/app/api/ingest/auto/route.ts
+﻿// frontend/app/api/ingest/auto/route.ts
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
@@ -284,7 +284,7 @@ export async function POST(req: Request) {
           finished_at: finishedIso,
           ok: args.ok,
           fetched_count: args.fetched,
-          inserted_docs: args.upserted, // keeping your column name, but it’s “upserted”
+          inserted_docs: args.upserted, // keeping your column name, but itâ€™s â€œupsertedâ€
           chunked_docs: args.chunked,
           meta: args.meta ?? null,
         })
@@ -307,7 +307,7 @@ export async function POST(req: Request) {
       // 7) Call internal search API
       const searchResp = await fetch(`${baseUrl}/api/search`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "x-ingest-secret": expected },
         body: JSON.stringify(payload),
       });
 
@@ -423,3 +423,4 @@ export async function POST(req: Request) {
 
   return json(200, { ok: true, phase: "done", jobs: jobs.length, results });
 }
+
