@@ -1,4 +1,4 @@
-// frontend/middleware.js
+﻿// frontend/middleware.js
 import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
@@ -28,6 +28,16 @@ function getSupabase(req) {
 
 export async function middleware(req) {
   const { pathname } = req.nextUrl;
+
+// Public API routes (no auth)
+if (pathname === "/api/health") return NextResponse.next();
+if (pathname.startsWith("/api/auth/")) return NextResponse.next();
+if (pathname.startsWith("/api/ingest/")) return NextResponse.next();
+
+// Public API routes (no auth)
+if (pathname === "/api/health") return NextResponse.next();
+if (pathname.startsWith("/api/auth/")) return NextResponse.next();
+if (pathname.startsWith("/api/ingest/")) return NextResponse.next();
 
   // Always allow preflight
   if (req.method === "OPTIONS") return NextResponse.next();
@@ -125,3 +135,6 @@ export async function middleware(req) {
 export const config = {
   matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
+
+
+
