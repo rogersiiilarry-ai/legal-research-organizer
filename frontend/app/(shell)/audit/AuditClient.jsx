@@ -311,7 +311,7 @@ export default function AuditClient() {
 
     setRunningMaterialize(true);
     try {
-      const j = await fetchJson("/api/audit/run", {
+      const j = await fetchJson("/api/research", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

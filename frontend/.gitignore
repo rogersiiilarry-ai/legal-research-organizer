@@ -1,1 +1,3 @@
 .vercel
+*.bak_*
+*.bak

@@ -1,10 +1,15 @@
-// frontend/app/api/audit/export/pdf/route.ts
+﻿// frontend/app/api/audit/export/pdf/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
 import { PDFDocument, StandardFonts, rgb, degrees } from "pdf-lib";
-
+import { addTeachingToFindings } from "@/lib/education/teaching";
+import { attachSnippetTeaching } from "@/lib/education/attachSnippetTeaching";
+import { attachExcerptTeaching } from "@/lib/education/attachExcerptTeaching";
+import { attachEvidenceStatus } from "@/lib/education/attachEvidenceStatus";
+import { attachDocumentTeaching } from "@/lib/education/attachDocumentTeaching";
+import { attachReaderTasks } from "@/lib/education/attachReaderTasks";
 export const runtime = "nodejs";
 
 /* -------------------------------- helpers -------------------------------- */
@@ -268,39 +273,62 @@ function drawKeyValueRow(cur: Cursor, fonts: Fonts, key: string, value: string) 
 function evidenceToHuman(evidence: any): { bullets: string[] } {
   const bullets: string[] = [];
 
-  if (Array.isArray(evidence)) {
-    for (const item of evidence) {
-      if (item && typeof item === "object") {
-        const type = safeStr(String((item as any).type || ""), 40);
-        const key = safeStr(String((item as any).key || ""), 80);
-        const value = (item as any).value;
+  const stripBullets = (s: string): string => {
+    return String(s ?? "")
+      .replace(/^[\s\u2022\-\u2013\u2014]+/g, "") // leading bullets/dashes
+      .replace(/â€¢/g, "").replace(/•/g, "")                       // bad-encoded bullet sequence
+      .trim();
+  };
 
-        if (type === "metric") {
-          bullets.push(`${key || "metric"}: ${String(value)}`);
-        } else if (type === "note") {
-          bullets.push(String((item as any).value || ""));
-        } else {
-          // generic object
-          const json = safeStr(JSON.stringify(item), 500);
-          if (json) bullets.push(json);
-        }
-      } else if (typeof item === "string") {
-        bullets.push(item);
-      }
+
+    const push = (line: string) => {
+    const cleaned = stripBullets(safeStr(line, 600));
+    if (!cleaned) return;
+    bullets.push(cleaned);
+  };
+
+  const handleItem = (item: any) => {
+    if (!item) return;
+
+    // We only want document-anchored evidence in the PDF:
+    // snippet + optional explanation. No object dumps.
+    if (typeof item === "string") {
+      // Only keep string items if they look like excerpt lines (avoid dumping raw "key: value")
+      // You can tighten this later, but this prevents the 'key/type/value' noise.
+      const s = safeStr(item, 520);
+      if (s && !s.match(/^\s*(key|type|value|count)\s*:/i)) push(s);
+      return;
     }
-    return { bullets: bullets.filter(Boolean) };
+
+    if (typeof item !== "object") return;
+
+    const sn = typeof item.snippet === "string" ? safeStr(item.snippet, 520) : "";
+    const ex = typeof item.explanation === "string" ? safeStr(item.explanation, 420) : "";
+
+    // Only print if we have an excerpt/snippet from the uploaded document
+    if (sn) {
+      push(sn);
+      if (ex) push(`Why it matters: ${ex}`);
+    }
+  };
+
+  if (Array.isArray(evidence)) {
+    for (const item of evidence) handleItem(item);
+    return { bullets };
+  }
+
+  if (typeof evidence === "string") {
+    handleItem(evidence);
+    return { bullets };
   }
 
   if (evidence && typeof evidence === "object") {
-    // common shape {metrics:{...}} etc
-    const entries = Object.entries(evidence);
-    for (const [k, v] of entries) bullets.push(`${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
-    return { bullets: bullets.filter(Boolean) };
+    // If a single object was provided, still enforce snippet-only output
+    handleItem(evidence);
+    return { bullets };
   }
 
-  if (typeof evidence === "string") return { bullets: [evidence] };
-
-  return { bullets: [] };
+  return { bullets };
 }
 
 function findingMeaning(f: any): string {
@@ -361,11 +389,22 @@ export async function GET(req: Request) {
     }
 
     const meta = analysis?.meta || {};
-    const findings = Array.isArray(meta?.findings) ? meta.findings : [];
+  let findings = Array.isArray(meta?.findings) ? meta.findings : [];
+findings = attachReaderTasks(
+  attachDocumentTeaching(
+    attachExcerptTeaching(
+      attachSnippetTeaching(
+        attachEvidenceStatus(
+          attachExcerptTeaching(addTeachingToFindings(findings))
+        )
+      )
+    )
+  )
+);
     const executedAt = safeStr(meta?.executed_at || "", 80) || new Date().toISOString();
     const tier = normalizeTier(meta?.executed_tier || meta?.tier);
 
-    // Pull a couple helpful “coverage” numbers if they exist
+    // Pull a couple helpful â€œcoverageâ€ numbers if they exist
     let chunkCount: number | null = null;
     let statementEstimate: number | null = null;
     for (const f of findings) {
@@ -377,7 +416,72 @@ export async function GET(req: Request) {
           if (m1) chunkCount = Number(m1[1]);
           if (m2) statementEstimate = Number(m2[1]);
         }
-      }
+      
+          // Render excerptTeaching (research-only)
+          if (Array.isArray((f as any)?.evidence)) {
+            for (const e of (f as any).evidence) {
+              const t = (e as any)?.excerptTeaching;
+              if (!t) continue;
+
+              cur = drawTextBlock(
+                pdf,
+                cur,
+                "Excerpt (from document):",
+                fonts.bold,
+                10.5,
+                rgb(0.06, 0.09, 0.12)
+              );
+
+              if (t.excerpt) {
+                cur = drawTextBlock(
+                  pdf,
+                  cur,
+                  `"${String(t.excerpt)}"`,
+                  fonts.regular,
+                  10.5,
+                  rgb(0.12, 0.14, 0.16)
+                );
+              }
+
+              if (t.interpretation) {
+                cur = drawTextBlock(
+                  pdf,
+                  cur,
+                  "Interpretation:",
+                  fonts.bold,
+                  10.5,
+                  rgb(0.06, 0.09, 0.12)
+                );
+                cur = drawTextBlock(
+                  pdf,
+                  cur,
+                  String(t.interpretation),
+                  fonts.regular,
+                  10.5,
+                  rgb(0.12, 0.14, 0.16)
+                );
+              }
+
+              if (t.readerCheck) {
+                cur = drawTextBlock(
+                  pdf,
+                  cur,
+                  "Reader check:",
+                  fonts.bold,
+                  10.5,
+                  rgb(0.06, 0.09, 0.12)
+                );
+                cur = drawTextBlock(
+                  pdf,
+                  cur,
+                  String(t.readerCheck),
+                  fonts.regular,
+                  10.5,
+                  rgb(0.12, 0.14, 0.16)
+                );
+              }
+            }
+          }}
     }
 
     // ----------------- build pdf -----------------
@@ -418,12 +522,12 @@ export async function GET(req: Request) {
 
     const rows: Array<{ k: string; v: string }> = [
       { k: "Analysis ID", v: String(analysis.id) },
-      { k: "Status", v: safeStr(analysis.status, 60) || "—" },
-      { k: "Target document", v: safeStr(analysis.target_document_id, 120) || "—" },
+      { k: "Status", v: safeStr(analysis.status, 60) || "â€”" },
+      { k: "Target document", v: safeStr(analysis.target_document_id, 120) || "â€”" },
       { k: "Executed at", v: fmtDate(executedAt) },
       { k: "Tier", v: tier.toUpperCase() },
-      { k: "Coverage", v: chunkCount != null ? `${chunkCount} text chunks` : "—" },
-      { k: "Sentence estimate", v: statementEstimate != null ? `${statementEstimate}` : "—" },
+      { k: "Coverage", v: chunkCount != null ? `${chunkCount} text chunks` : "â€”" },
+      { k: "Sentence estimate", v: statementEstimate != null ? `${statementEstimate}` : "â€”" },
       { k: "Findings", v: `${findings.length}` },
     ];
 
@@ -508,9 +612,34 @@ export async function GET(req: Request) {
         cur = drawTextBlock(pdf, cur, claim, fonts.regular, 11, rgb(0.12, 0.14, 0.16));
 
         // What it means
-        cur = drawTextBlock(pdf, cur, `What it means: ${meaning}`, fonts.regular, 10.5, rgb(0.20, 0.24, 0.28));
+        cur = drawTextBlock(pdf, cur, `What it means: ${meaning}
+${(f as any).teaching ? `\nTeaching note: ${(f as any).teaching}` : ``}`, fonts.regular, 10.5, rgb(0.20, 0.24, 0.28));
 
-            // Evidence
+            
+        
+        // Reader task (actionable next step for the reviewer)
+        if ((f as any).readerTask) {
+          cur = drawTextBlock(
+            pdf,
+            cur,
+            String((f as any).readerTask),
+            fonts.regular,
+            10,
+            rgb(0.15, 0.15, 0.15)
+          );
+        }// Teaching note (adds practical interpretation; kept separate from the meaning blurb)
+        const teaching = safeStr((f as any)?.teaching || "", 1200);
+        if (teaching) {
+          const t = teaching.replace(/^Teaching note:\s*/i, "");
+          cur = drawTextBlock(
+            pdf,
+            cur,
+            `Teaching note: ${t}`,
+            fonts.regular,
+            10.5,
+            rgb(0.20, 0.24, 0.31)
+          );
+        }// Evidence
         if (ev.bullets.length) {
           cur = drawTextBlock(
             pdf,
@@ -525,7 +654,14 @@ export async function GET(req: Request) {
             cur = drawTextBlock(
               pdf,
               cur,
-              `• ${b}`,
+              (() => {
+                const line = String(b ?? "")
+                  .replace(/â€¢/g, "")
+                  .replace(/â€¢/g, "").replace(/•/g, "")
+                  .replace(/^[\s\u2022\-–—]+/g, "")
+                  .trim();
+                return line ? `• ${line}` : "•";
+              })(),
               fonts.regular,
               10.5,
               rgb(0.12, 0.14, 0.16)
@@ -569,3 +705,37 @@ export async function GET(req: Request) {
     );
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
