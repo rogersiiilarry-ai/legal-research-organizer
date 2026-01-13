@@ -1,3 +1,4 @@
+// frontend/app/api/upload/pdf/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
@@ -6,6 +7,8 @@ import crypto from "crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/* -------------------------------- helpers -------------------------------- */
 
 function json(status: number, payload: any) {
   return NextResponse.json(payload, {
@@ -48,6 +51,8 @@ function isPdfContentType(ct: string) {
   return s === "application/pdf" || s === "application/x-pdf";
 }
 
+/* ---------------------------------- auth ---------------------------------- */
+
 type Auth =
   | { ok: true; userId: string }
   | { ok: false; status: number; error: string };
@@ -63,6 +68,7 @@ async function requireUser(): Promise<Auth> {
         get(name: string) {
           return cookieStore.get(name)?.value;
         },
+        // Route Handlers: cookie mutation isn't reliably applied; bearer is handled elsewhere.
         set() {},
         remove() {},
       },
@@ -90,10 +96,15 @@ function storageAdmin() {
  * Returns:
  *  { bucket, path, uploadUrl, token, contentType }
  *
- * Client MUST upload using:
- *  fetch(uploadUrl, { method:"PUT", headers:{ "content-type": contentType, "x-upsert":"false", ...(token?{"Authorization":`Bearer ${token}`}:{}) }, body:file })
- *
- * Then store {bucket, path} into documents.raw.storage_bucket / raw.storage_path.
+ * Client uploads:
+ *  fetch(uploadUrl, {
+ *    method: "PUT",
+ *    headers: {
+ *      "content-type": contentType,
+ *      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+ *    },
+ *    body: file
+ *  })
  */
 export async function POST(req: Request) {
   try {
@@ -103,9 +114,10 @@ export async function POST(req: Request) {
     const body = await readJson(req);
 
     const filename = safeFilename(safeStr(body?.filename, 200) || "upload.pdf");
-    const contentType = safeStr(body?.contentType, 100) || "application/pdf";
+    const requestedCt = safeStr(body?.contentType, 100) || "application/pdf";
 
-    if (!isPdfContentType(contentType) && !filename.toLowerCase().endsWith(".pdf")) {
+    // Only PDF supported (either via content-type or filename extension).
+    if (!isPdfContentType(requestedCt) && !filename.toLowerCase().endsWith(".pdf")) {
       return json(400, { ok: false, error: "Only PDF uploads are supported." });
     }
 
@@ -117,27 +129,30 @@ export async function POST(req: Request) {
 
     const admin = storageAdmin();
 
-    // Preferred: signed upload URL
-    // @ts-ignore typings differ by version
+    // Supabase typings differ across versions; normalize to the fields we need.
     const up = await admin.storage.from(bucket).createSignedUploadUrl(path);
+    const data = (up as any)?.data as { signedUrl?: string; token?: string } | undefined;
 
-    const signedUrl = up?.data?.signedUrl || up?.data?.signedURL || null;
-    const token = up?.data?.token || null;
+    const uploadUrl = data?.signedUrl ?? null;
+    const token = data?.token ?? null;
 
-    if (up.error || !signedUrl) {
+    if ((up as any)?.error || !uploadUrl) {
       return json(500, {
         ok: false,
-        error: up.error?.message || "Failed to create signed upload URL.",
+        error: (up as any)?.error?.message || "Failed to create signed upload URL.",
       });
     }
+
+    // We always enforce PDF for the upload.
+    const contentType = "application/pdf";
 
     return json(200, {
       ok: true,
       bucket,
       path,
-      contentType: "application/pdf",
-      uploadUrl: signedUrl,
-      token, // may be required by your storage config
+      contentType,
+      uploadUrl,
+      token,
     });
   } catch (e: any) {
     return json(500, { ok: false, error: e?.message || String(e) });

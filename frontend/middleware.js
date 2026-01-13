@@ -1,9 +1,13 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
-/* ----------------------------- path helpers ----------------------------- */
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing ${name}`);
+  return v;
+}
 
-function isPublicPath(pathname: string) {
+function isPublicPath(pathname) {
   return (
     pathname === "/" ||
     pathname === "/login" ||
@@ -13,33 +17,28 @@ function isPublicPath(pathname: string) {
   );
 }
 
-function isPublicApi(pathname: string) {
+function isPublicApi(pathname) {
   // No auth at all
   return pathname === "/api/health" || pathname.startsWith("/api/auth/");
 }
 
-function isIngestPath(pathname: string) {
+function isIngestPath(pathname) {
   // System secret ONLY
   return pathname.startsWith("/api/ingest/");
 }
 
-function isDualAuthApi(pathname: string) {
+function isDualAuthApi(pathname) {
   // Allow either:
   //  - system secret (x-ingest-secret) for internal automation
   //  - user cookie auth for normal logged-in users
   if (pathname === "/api/search") return true;
-
   if (pathname.startsWith("/api/resolve/")) return true;
-
-  // materialize-and-run internal call + materialize endpoint
   if (pathname.startsWith("/api/audit/run/materialize")) return true;
   if (pathname.startsWith("/api/documents/") && pathname.endsWith("/materialize")) return true;
-
   return false;
 }
 
-function isProtectedApi(pathname: string) {
-  // Everything under /api except explicit exclusions
+function isProtectedApi(pathname) {
   return (
     pathname.startsWith("/api/") &&
     !isPublicApi(pathname) &&
@@ -48,7 +47,7 @@ function isProtectedApi(pathname: string) {
   );
 }
 
-function isProtectedApp(pathname: string) {
+function isProtectedApp(pathname) {
   return (
     pathname === "/app" ||
     pathname.startsWith("/app/") ||
@@ -59,16 +58,14 @@ function isProtectedApp(pathname: string) {
   );
 }
 
-function checkSystemSecret(req: Request) {
+function checkSystemSecret(req) {
   const provided = req.headers.get("x-ingest-secret") || "";
   const expected = process.env.INGEST_SECRET || "";
   if (!expected) return false;
   return provided === expected;
 }
 
-/* ------------------------------- middleware ------------------------------ */
-
-export async function middleware(req: any) {
+export async function middleware(req) {
   const { pathname } = req.nextUrl;
 
   // Always allow public paths and public APIs
@@ -101,17 +98,17 @@ export async function middleware(req: any) {
   const res = NextResponse.next();
 
   const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+    mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
     {
       cookies: {
-        get(name: string) {
+        get(name) {
           return req.cookies.get(name)?.value;
         },
-        set(name: string, value: string, options: any) {
+        set(name, value, options) {
           res.cookies.set({ name, value, ...options });
         },
-        remove(name: string, options: any) {
+        remove(name, options) {
           res.cookies.set({ name, value: "", ...options, maxAge: 0 });
         },
       },
