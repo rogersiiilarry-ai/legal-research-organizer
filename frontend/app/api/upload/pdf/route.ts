@@ -1,4 +1,3 @@
-// frontend/app/api/upload/pdf/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
@@ -7,8 +6,6 @@ import crypto from "crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-/* ------------------------------- helpers ------------------------------- */
 
 function json(status: number, payload: any) {
   return NextResponse.json(payload, {
@@ -51,8 +48,6 @@ function isPdfContentType(ct: string) {
   return s === "application/pdf" || s === "application/x-pdf";
 }
 
-/* -------------------------------- auth -------------------------------- */
-
 type Auth =
   | { ok: true; userId: string }
   | { ok: false; status: number; error: string };
@@ -88,18 +83,17 @@ function storageAdmin() {
   );
 }
 
-/* -------------------------------- route -------------------------------- */
 /**
  * POST JSON:
  *  { filename: string, contentType?: string, folder?: string }
  *
  * Returns:
- *  { bucket, path, uploadUrl, token, expiresIn, contentType }
+ *  { bucket, path, uploadUrl, token, contentType }
  *
- * Client then does:
- *  fetch(uploadUrl, { method: "PUT", headers: {"content-type": contentType}, body: file })
+ * Client MUST upload using:
+ *  fetch(uploadUrl, { method:"PUT", headers:{ "content-type": contentType, "x-upsert":"false", ...(token?{"Authorization":`Bearer ${token}`}:{}) }, body:file })
  *
- * After upload, store {bucket, path} on documents.raw (raw.storage_bucket/raw.storage_path)
+ * Then store {bucket, path} into documents.raw.storage_bucket / raw.storage_path.
  */
 export async function POST(req: Request) {
   try {
@@ -123,20 +117,14 @@ export async function POST(req: Request) {
 
     const admin = storageAdmin();
 
-    // 10 minutes
-    const expiresIn = 60 * 10;
-
-    /**
-     * Preferred: signed upload URL (PUT)
-     * This avoids Vercel body-size limits entirely.
-     *
-     * Supabase JS currently returns:
-     *  { signedUrl: string, token: string, path: string }
-     */
-    // @ts-ignore - typings may lag across versions
+    // Preferred: signed upload URL
+    // @ts-ignore typings differ by version
     const up = await admin.storage.from(bucket).createSignedUploadUrl(path);
 
-    if (up.error || !up.data?.signedUrl) {
+    const signedUrl = up?.data?.signedUrl || up?.data?.signedURL || null;
+    const token = up?.data?.token || null;
+
+    if (up.error || !signedUrl) {
       return json(500, {
         ok: false,
         error: up.error?.message || "Failed to create signed upload URL.",
@@ -148,9 +136,8 @@ export async function POST(req: Request) {
       bucket,
       path,
       contentType: "application/pdf",
-      uploadUrl: up.data.signedUrl,
-      token: up.data.token || null,
-      expiresIn,
+      uploadUrl: signedUrl,
+      token, // may be required by your storage config
     });
   } catch (e: any) {
     return json(500, { ok: false, error: e?.message || String(e) });
