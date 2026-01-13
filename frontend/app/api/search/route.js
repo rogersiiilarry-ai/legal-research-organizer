@@ -1,71 +1,95 @@
-// frontend/app/api/search/route.js
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /* =========================================================
-   CourtListener Search API (v4) + Query-Driven Relevance (JS)
-   Robust request parsing (curl.exe + PowerShell safe)
+   AUTH (dual mode)
+   - System: x-ingest-secret === INGEST_SECRET
+   - User: Supabase cookie session
 ========================================================= */
 
-const BASE =
-  process.env.COURTLISTENER_BASE || "https://www.courtlistener.com/api/rest/v4";
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing ${name}`);
+  return v;
+}
 
-/**
- * Regions:
- * - mi_state_only: Michigan Supreme Court + Court of Appeals
- * - mi_federal: MI federal district courts + Sixth Circuit
- * - mi_state_and_federal: combined MI state + MI federal + CA6
- * - mi_surrounding: MI + surrounding fed/state buckets
- * - mi_surrounding_state_first: MI state bucket first
- */
+function json(status, payload) {
+  return NextResponse.json(payload, { status, headers: { "Cache-Control": "no-store" } });
+}
+
+function safeText(v) {
+  return typeof v === "string" ? v : "";
+}
+
+async function requireSystemOrUser(req) {
+  const provided = safeText(req.headers.get("x-ingest-secret")).trim();
+  const expected = safeText(process.env.INGEST_SECRET).trim();
+
+  // System secret bypass
+  if (expected && provided && provided === expected) {
+    return { ok: true, mode: "system", userId: null };
+  }
+
+  // User cookie auth (browser)
+  const cookieStore = cookies();
+  const res = NextResponse.next();
+
+  const supabase = createServerClient(
+    mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+    mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
+    {
+      cookies: {
+        get(name) {
+          return cookieStore.get(name)?.value;
+        },
+        set(name, value, options) {
+          res.cookies.set({ name, value, ...options });
+        },
+        remove(name, options) {
+          res.cookies.set({ name, value: "", ...options, maxAge: 0 });
+        },
+      },
+    }
+  );
+
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data?.user?.id) return { ok: false, status: 401, error: "Unauthorized" };
+
+  return { ok: true, mode: "user", userId: data.user.id };
+}
+
+/* =========================================================
+   CourtListener Search API (v4) + hardened parsing (JS)
+========================================================= */
+
+const BASE = process.env.COURTLISTENER_BASE || "https://www.courtlistener.com/api/rest/v4";
+
 const REGION_COURTS = {
   mi_state_only: ["mich", "michctapp"],
   mi_federal: ["mied", "miwd", "ca6"],
   mi_state_and_federal: ["mich", "michctapp", "mied", "miwd", "ca6"],
 
   mi_surrounding: [
-    "mied",
-    "miwd",
-    "ca6",
-    "ohnd",
-    "ohsd",
-    "innd",
-    "insd",
-    "ilnd",
-    "ilcd",
-    "ilsd",
-    "wied",
-    "wiwd",
+    "mied", "miwd", "ca6",
+    "ohnd", "ohsd",
+    "innd", "insd",
+    "ilnd", "ilcd", "ilsd",
+    "wied", "wiwd",
     "mnd",
     "ohioctapp",
     "illappct",
   ],
-  mi_surrounding_state_first: [
-    "mied",
-    "miwd",
-    "mich",
-    "michctapp",
-    "ohioctapp",
-    "illappct",
-  ],
+  mi_surrounding_state_first: ["mied", "miwd", "mich", "michctapp", "ohioctapp", "illappct"],
 };
 
-// Response caps
 const LIMIT_MIN = 1;
 const LIMIT_MAX = 50;
 const LIMIT_DEFAULT = 10;
 
-// Enrichment caps
-const ENRICH_LIMIT = 4;
-const OPINION_SCAN_MAX_CHARS = 250_000;
-
-/* =========================================================
-   UTILS
-========================================================= */
-
-const safeText = (v) => (typeof v === "string" ? v : "");
 const uniq = (arr) => [...new Set((arr || []).filter(Boolean))];
 
 const clampInt = (n, min, max, d) => {
@@ -75,20 +99,8 @@ const clampInt = (n, min, max, d) => {
 
 const splitCsv = (v) =>
   typeof v === "string"
-    ? v
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean)
+    ? v.split(",").map((s) => s.trim()).filter(Boolean)
     : [];
-
-function toBool(v) {
-  if (v === true || v === 1) return true;
-  if (typeof v === "string") {
-    const s = v.trim().toLowerCase();
-    return s === "true" || s === "1" || s === "yes";
-  }
-  return false;
-}
 
 function safeLimit(n) {
   return clampInt(n, LIMIT_MIN, LIMIT_MAX, LIMIT_DEFAULT);
@@ -98,9 +110,7 @@ function isObject(v) {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-/* =========================================================
-   ROBUST BODY PARSING (FIXES YOUR CURL/PS ISSUES)
-========================================================= */
+/* ------------------ robust body parsing (your original) ------------------ */
 
 function tryJsonParse(s) {
   try {
@@ -111,17 +121,13 @@ function tryJsonParse(s) {
 }
 
 function tryUnwrapQuotedJson(raw) {
-  // Handles cases where body arrives as a JSON string containing JSON
-  // e.g. "\"{\\\"q\\\":\\\"x\\\"}\"" or "'{...}'"
   let s = safeText(raw).trim();
   if (!s) return null;
 
-  // Strip wrapping single quotes (PowerShell often preserves them literally)
   if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith("’") && s.endsWith("’"))) {
     s = s.slice(1, -1).trim();
   }
 
-  // If it's a quoted JSON string, parse once to get inner JSON text
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("“") && s.endsWith("”"))) {
     const inner = tryJsonParse(s);
     if (typeof inner === "string") {
@@ -130,7 +136,6 @@ function tryUnwrapQuotedJson(raw) {
     }
   }
 
-  // If it now looks like JSON, parse normally
   const obj = tryJsonParse(s);
   if (obj) return obj;
 
@@ -151,12 +156,9 @@ function tryFormUrlEncoded(raw) {
 }
 
 function tryLooseObject(raw) {
-  // Handles your observed pattern: {q:michigan smoke,region:mi_state_and_federal}
-  // This is NOT JSON, but we can salvage it.
   const s = safeText(raw).trim();
   if (!s.startsWith("{") || !s.endsWith("}")) return null;
 
-  // Remove braces, split by commas, split each by first colon
   const inner = s.slice(1, -1).trim();
   if (!inner) return null;
 
@@ -175,7 +177,6 @@ function tryLooseObject(raw) {
 async function readBodyBestEffort(req) {
   const contentType = safeText(req.headers.get("content-type")).toLowerCase();
 
-  // Read raw body ONCE
   let raw = "";
   try {
     raw = await req.text();
@@ -185,30 +186,21 @@ async function readBodyBestEffort(req) {
 
   const rawPreview = raw.length > 240 ? raw.slice(0, 240) : raw;
 
-  // 1) JSON parse (normal)
   let parsed = tryJsonParse(raw);
-
-  // 2) Unwrap quoted JSON / strip wrapping quotes
   if (!parsed) parsed = tryUnwrapQuotedJson(raw);
 
-  // 3) x-www-form-urlencoded
   if (!parsed && contentType.includes("application/x-www-form-urlencoded")) {
     parsed = tryFormUrlEncoded(raw);
   }
-  // Even if content-type claims JSON, try salvage if it looks form-like
   if (!parsed) parsed = tryFormUrlEncoded(raw);
 
-  // 4) salvage loose object-ish body like {q:abc,region:def}
   if (!parsed) parsed = tryLooseObject(raw);
 
-  // Ensure object
   if (!isObject(parsed)) parsed = {};
-
-  return { parsed, raw, rawPreview, contentType };
+  return { parsed, rawPreview, contentType };
 }
 
 function pickQ(body) {
-  // accept several names
   const q =
     (typeof body.q === "string" && body.q) ||
     (typeof body.query === "string" && body.query) ||
@@ -218,9 +210,7 @@ function pickQ(body) {
   return q.trim();
 }
 
-/* =========================================================
-   UPSTREAM QUERY BUILDING
-========================================================= */
+/* ------------------ upstream query building (your original) ------------------ */
 
 function buildCourtClause(courts) {
   const list = uniq((courts || []).map((x) => safeText(x).trim().toLowerCase()).filter(Boolean));
@@ -243,7 +233,6 @@ function buildEffectiveQuery({ q, mode, courts, filedAfter, filedBefore }) {
 
   let clause = query;
 
-  // "topic" mode can expand lightly; keep it safe
   if (mode === "topic") {
     const full = `"${query.replace(/"/g, "")}"`;
     clause = `(${full} OR ${query})`;
@@ -262,10 +251,6 @@ function applyOrderBy(url, sort) {
   else if (s === "citeCount_desc") url.searchParams.set("order_by", "citeCount desc");
   else if (s === "citeCount_asc") url.searchParams.set("order_by", "citeCount asc");
 }
-
-/* =========================================================
-   UPSTREAM FETCH
-========================================================= */
 
 async function upstreamJson(url, token) {
   const res = await fetch(url, {
@@ -287,9 +272,7 @@ async function upstreamJson(url, token) {
   return { ok: true, status: 200, data };
 }
 
-/* =========================================================
-   NORMALIZATION (LIGHT)
-========================================================= */
+/* ------------------ normalization (your original) ------------------ */
 
 function pickFirstDownloadUrl(item) {
   const opinions = Array.isArray(item?.opinions) ? item.opinions : [];
@@ -330,67 +313,52 @@ function normalize(item) {
 ========================================================= */
 
 export async function GET(req) {
-  return NextResponse.json({
+  // Auth required even for GET (so users don’t leak tokenPresent/base info publicly)
+  const auth = await requireSystemOrUser(req);
+  if (auth.ok === false) return json(auth.status, { ok: false, error: auth.error });
+
+  return json(200, {
     ok: true,
-    env: {
-      tokenPresent: !!process.env.COURTLISTENER_TOKEN,
-      base: BASE,
-    },
     regions: Object.keys(REGION_COURTS),
-    regionDefaults: REGION_COURTS,
-    note:
-      "POST expects JSON body with at least { q: string }. This route has hardened parsing for curl.exe + PowerShell.",
+    note: "POST expects JSON body with at least { q: string }.",
   });
 }
 
 export async function POST(req) {
-  const token = process.env.COURTLISTENER_TOKEN;
-  if (!token) {
-    return NextResponse.json(
-      { ok: false, error: "Missing COURTLISTENER_TOKEN in environment." },
-      { status: 500 }
-    );
-  }
+  const auth = await requireSystemOrUser(req);
+  if (auth.ok === false) return json(auth.status, { ok: false, error: auth.error });
 
-  // Parse body robustly
+  const token = process.env.COURTLISTENER_TOKEN;
+  if (!token) return json(500, { ok: false, error: "Missing COURTLISTENER_TOKEN in environment." });
+
   const { parsed: body, rawPreview, contentType } = await readBodyBestEffort(req);
 
-  // Also accept URL params if present
   const u = new URL(req.url);
   const urlParams = {
     q: u.searchParams.get("q") || u.searchParams.get("query") || "",
     mode: u.searchParams.get("mode") || "",
     region: u.searchParams.get("region") || "",
-    level: u.searchParams.get("level") || "",
     courts: splitCsv(u.searchParams.get("courts") || ""),
     filedAfter: u.searchParams.get("filedAfter") || "",
     filedBefore: u.searchParams.get("filedBefore") || "",
     sort: u.searchParams.get("sort") || "",
     limit: u.searchParams.get("limit") || "",
-    strict: u.searchParams.get("strict") || "",
   };
 
-  // Merge url first, then body overrides
   const merged = { ...urlParams, ...(isObject(body) ? body : {}) };
 
   const q = pickQ(merged);
   const mode = merged.mode === "party" || merged.mode === "topic" ? merged.mode : "topic";
 
   const region =
-    typeof merged.region === "string" && merged.region.trim()
-      ? merged.region.trim()
-      : "mi_state_only";
+    typeof merged.region === "string" && merged.region.trim() ? merged.region.trim() : "mi_state_only";
 
-  const sort =
-    typeof merged.sort === "string" && merged.sort.trim()
-      ? merged.sort.trim()
-      : "dateFiled_desc";
-
+  const sort = typeof merged.sort === "string" && merged.sort.trim() ? merged.sort.trim() : "dateFiled_desc";
   const limit = safeLimit(merged.limit);
+
   const filedAfter = typeof merged.filedAfter === "string" ? merged.filedAfter.trim() : "";
   const filedBefore = typeof merged.filedBefore === "string" ? merged.filedBefore.trim() : "";
 
-  // Courts default by region
   let courts = [];
   if (Array.isArray(merged.courts)) courts = merged.courts;
   else if (typeof merged.courts === "string") courts = splitCsv(merged.courts);
@@ -399,29 +367,18 @@ export async function POST(req) {
   const finalCourts = uniq((courts.length ? courts : defaultCourts).map((x) => safeText(x)));
 
   if (!q) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Missing 'q' (query).",
-        debugEcho: {
-          contentType,
-          rawBodyPreview: rawPreview,
-          bodyKeys: Object.keys(isObject(body) ? body : {}),
-          bodyQ: isObject(body) ? (body.q ?? body.query ?? body.term ?? body.text ?? null) : null,
-          urlParams,
-        },
+    return json(400, {
+      ok: false,
+      error: "Missing 'q' (query).",
+      debugEcho: {
+        contentType,
+        rawBodyPreview: rawPreview,
+        bodyKeys: Object.keys(isObject(body) ? body : {}),
       },
-      { status: 400 }
-    );
+    });
   }
 
-  const effectiveQuery = buildEffectiveQuery({
-    q,
-    mode,
-    courts: finalCourts,
-    filedAfter,
-    filedBefore,
-  });
+  const effectiveQuery = buildEffectiveQuery({ q, mode, courts: finalCourts, filedAfter, filedBefore });
 
   const url = new URL(`${BASE.replace(/\/$/, "")}/search/`);
   url.searchParams.set("q", effectiveQuery);
@@ -429,14 +386,12 @@ export async function POST(req) {
   applyOrderBy(url, sort);
 
   const up = await upstreamJson(url.toString(), token);
-  if (!up.ok) {
-    return NextResponse.json({ ok: false, kind: "search", ...up }, { status: 502 });
-  }
+  if (!up.ok) return json(502, { ok: false, kind: "search", ...up });
 
   const raw = Array.isArray(up.data?.results) ? up.data.results : [];
   const results = raw.slice(0, limit).map(normalize);
 
-  return NextResponse.json({
+  return json(200, {
     ok: true,
     kind: "search",
     q,
