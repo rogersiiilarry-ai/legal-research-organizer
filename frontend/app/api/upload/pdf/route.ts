@@ -80,16 +80,26 @@ async function requireUser(): Promise<Auth> {
   return { ok: true, userId: data.user.id };
 }
 
+function storageAdmin() {
+  return createClient(
+    mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+    mustEnv("SUPABASE_SERVICE_ROLE_KEY"),
+    { auth: { persistSession: false } }
+  );
+}
+
 /* -------------------------------- route -------------------------------- */
 /**
  * POST JSON:
  *  { filename: string, contentType?: string, folder?: string }
  *
  * Returns:
- *  { bucket, path, uploadUrl, readUrl, expiresIn }
+ *  { bucket, path, uploadUrl, token, expiresIn, contentType }
  *
  * Client then does:
- *  fetch(uploadUrl, { method: "PUT", headers: {"content-type":"application/pdf"}, body: file })
+ *  fetch(uploadUrl, { method: "PUT", headers: {"content-type": contentType}, body: file })
+ *
+ * After upload, store {bucket, path} on documents.raw (raw.storage_bucket/raw.storage_path)
  */
 export async function POST(req: Request) {
   try {
@@ -111,41 +121,35 @@ export async function POST(req: Request) {
     const nonce = crypto.randomBytes(12).toString("hex");
     const path = `${auth.userId}/${folder}/${Date.now()}_${nonce}_${filename}`;
 
-    const admin = createClient(
-      mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
-      mustEnv("SUPABASE_SERVICE_ROLE_KEY"),
-      { auth: { persistSession: false } }
-    );
+    const admin = storageAdmin();
 
     // 10 minutes
     const expiresIn = 60 * 10;
 
     /**
-     * Compatibility approach:
-     * createSignedUrl(path, expiresIn) returns a signed URL that can be used
-     * for access. Many setups allow PUT/POST to that signed URL for upload as well.
+     * Preferred: signed upload URL (PUT)
+     * This avoids Vercel body-size limits entirely.
      *
-     * If your storage config only allows GET on signed URLs, tell me and I’ll switch
-     * to the newer createSignedUploadUrl() method.
+     * Supabase JS currently returns:
+     *  { signedUrl: string, token: string, path: string }
      */
-    const signed = await admin.storage.from(bucket).createSignedUrl(path, expiresIn);
-    if (signed.error || !signed.data?.signedUrl) {
-      return json(500, { ok: false, error: signed.error?.message || "Failed to create signed URL." });
+    // @ts-ignore - typings may lag across versions
+    const up = await admin.storage.from(bucket).createSignedUploadUrl(path);
+
+    if (up.error || !up.data?.signedUrl) {
+      return json(500, {
+        ok: false,
+        error: up.error?.message || "Failed to create signed upload URL.",
+      });
     }
-
-    const uploadUrl = signed.data.signedUrl;
-
-    // Also return a read URL (same as uploadUrl in this compatibility mode)
-    // If your bucket is public later, you can change this to a public URL.
-    const readUrl = uploadUrl;
 
     return json(200, {
       ok: true,
       bucket,
       path,
       contentType: "application/pdf",
-      uploadUrl,
-      readUrl,
+      uploadUrl: up.data.signedUrl,
+      token: up.data.token || null,
       expiresIn,
     });
   } catch (e: any) {
