@@ -1,4 +1,5 @@
-﻿import Stripe from "stripe";
+﻿// app/api/audit/run/materialize-and-run/route.ts
+import Stripe from "stripe";
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
@@ -10,7 +11,10 @@ export const dynamic = "force-dynamic";
 /* -------------------------------- helpers -------------------------------- */
 
 function json(status: number, payload: any) {
-  return NextResponse.json(payload, { status, headers: { "Cache-Control": "no-store" } });
+  return NextResponse.json(payload, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 function mustEnv(name: string) {
@@ -101,6 +105,8 @@ async function requireSystemOrUser(req: Request): Promise<AuthResult> {
 
   // User cookie auth (browser)
   const cookieStore = cookies();
+
+  // IMPORTANT: set/remove must be implemented so auth can refresh cookies
   const supabaseAuth = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
     mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
@@ -109,8 +115,12 @@ async function requireSystemOrUser(req: Request): Promise<AuthResult> {
         get(name: string) {
           return cookieStore.get(name)?.value;
         },
-        set() {},
-        remove() {},
+        set(name: string, value: string, options: any) {
+          cookieStore.set({ name, value, ...options });
+        },
+        remove(name: string, options: any) {
+          cookieStore.set({ name, value: "", ...options, maxAge: 0 });
+        },
       },
     }
   );
@@ -123,11 +133,9 @@ async function requireSystemOrUser(req: Request): Promise<AuthResult> {
 
 /* --------------------------- stripe + entitlement --------------------------- */
 /**
- * TODO: Wire this to real entitlements (recommended):
- * - payments table
- * - or user profile flag
- * - or analyses credits ledger
- *
+ * TODO: Wire this to real entitlements:
+ * - profiles.plan in ('basic','pro')
+ * - or subscriptions table with status='active'
  * For now: always false => always paywalled for user mode.
  */
 async function isEntitled(_supabase: any, _userId: string, _withPdf: boolean): Promise<boolean> {
@@ -138,7 +146,6 @@ function siteOrigin(req: Request) {
   const env = process.env.NEXT_PUBLIC_SITE_URL;
   if (env && env.trim()) return env.trim();
 
-  // VERCEL_URL is host-only, not a full origin
   const host = process.env.VERCEL_URL;
   if (host && host.trim()) return `https://${host.trim()}`;
 
@@ -150,16 +157,18 @@ function pickPrice(withPdf: boolean) {
 }
 
 async function createCheckout(origin: string, withPdf: boolean, userId: string, documentId: string) {
-  const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), { apiVersion: "2025-12-15.clover" });
+  // NOTE: Don’t override apiVersion unless you’re sure; Stripe default is safest
+  const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"));
 
   const price = pickPrice(withPdf);
 
-  // Keep this simple for now. You can swap these to a dedicated /checkout/success route later.
-  const success_url = `${origin}/app?checkout=success&doc=${encodeURIComponent(documentId)}`;
-  const cancel_url = `${origin}/pricing?checkout=cancel`;
+  // You can change these routes later; keep them stable for now
+  const success_url = `${origin}/audit?checkout=success&doc=${encodeURIComponent(documentId)}`;
+  const cancel_url = `${origin}/audit?checkout=cancel&doc=${encodeURIComponent(documentId)}`;
 
+  // PLANS => subscription
   const session = await stripe.checkout.sessions.create({
-    mode: "payment",
+    mode: "subscription",
     line_items: [{ price, quantity: 1 }],
     success_url,
     cancel_url,
@@ -167,7 +176,7 @@ async function createCheckout(origin: string, withPdf: boolean, userId: string, 
     metadata: {
       user_id: userId,
       document_id: documentId,
-      with_pdf: String(withPdf),
+      tier: withPdf ? "pro" : "basic",
       product: "materialize-and-run",
     },
   });
@@ -320,7 +329,6 @@ export async function POST(req: Request) {
     if (!documentToken) return json(400, { ok: false, phase: "input", error: "document_id is required" });
 
     const withPdf = Boolean(body?.withPdf ?? body?.with_pdf ?? u.searchParams.get("withPdf") === "1");
-
     const kind = String(body?.kind ?? u.searchParams.get("kind") ?? "case_fact_audit").trim() || "case_fact_audit";
     const maxFindings = clamp(asInt(body?.maxFindings, 25), 1, 100);
 
@@ -356,10 +364,10 @@ export async function POST(req: Request) {
 
         if (!checkoutUrl) return json(500, { ok: false, phase: "stripe", error: "Failed to create checkout session" });
 
-        // Browser navigation => redirect
+        // If this endpoint is hit via real browser navigation, a redirect is fine:
         if (wantsHtmlRedirect(req)) return NextResponse.redirect(checkoutUrl, 303);
 
-        // Non-browser caller => return URL
+        // But for fetch() calls, client must redirect using checkout_url:
         return json(402, { ok: false, phase: "stripe", error: "Payment required", checkout_url: checkoutUrl });
       }
     }
@@ -416,10 +424,7 @@ export async function POST(req: Request) {
 
     const text = normalizeText((chunksRes.data || []).map((r: any) => String(r.content || "")).join("\n\n"));
     if (!text) {
-      await supabase
-        .from("analyses")
-        .update({ status: "error", error: "Materialized but no text extracted" })
-        .eq("id", analysisId);
+      await supabase.from("analyses").update({ status: "error", error: "Materialized but no text extracted" }).eq("id", analysisId);
 
       return json(422, { ok: false, phase: "materialize", error: "Materialized but no text extracted", analysisId });
     }
