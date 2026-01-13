@@ -1,16 +1,16 @@
-﻿// frontend/app/api/audit/run/materialize-and-run/route.ts
-import Stripe from "stripe";
+﻿import Stripe from "stripe";
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 /* -------------------------------- helpers -------------------------------- */
 
 function json(status: number, payload: any) {
-  return NextResponse.json(payload, { status });
+  return NextResponse.json(payload, { status, headers: { "Cache-Control": "no-store" } });
 }
 
 function mustEnv(name: string) {
@@ -80,9 +80,7 @@ function chunkText(text: string, maxChars: number) {
 }
 
 function isUuid(v: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    v || ""
-  );
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v || "");
 }
 
 /* ---------------------------------- auth ---------------------------------- */
@@ -121,7 +119,61 @@ async function requireSystemOrUser(req: Request): Promise<AuthResult> {
   return { ok: true, mode: "user", userId: data.user.id };
 }
 
-/* ------------------------ document lookup (id or external_id) ------------------------ */
+/* --------------------------- stripe + entitlement --------------------------- */
+/**
+ * For now, treat "not entitled" as "always require purchase" unless you already
+ * have a paid flag in Supabase to check.
+ *
+ * Hook this up later to your own entitlement table (recommended).
+ */
+async function isEntitled(_supabase: any, _userId: string, _withPdf: boolean): Promise<boolean> {
+  return false;
+}
+
+function siteOriginFromEnv(req: Request) {
+  const env =
+    process.env.NEXT_PUBLIC_SITE_URL ||
+    process.env.VERCEL_URL ||
+    new URL(req.url).origin;
+
+  return env.startsWith("http") ? env : `https://${env}`;
+}
+
+function pickPrice(withPdf: boolean) {
+  // Your stated pricing:
+  // - $50 without PDF => BASIC
+  // - $100 with PDF => PRO
+  return withPdf ? mustEnv("STRIPE_PRICE_PRO") : mustEnv("STRIPE_PRICE_BASIC");
+}
+
+async function createCheckout(origin: string, withPdf: boolean, userId: string, documentId: string) {
+  const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), {
+    apiVersion: "2023-10-16",
+  });
+
+  const price = pickPrice(withPdf);
+
+  const success_url = `${origin}/app?checkout=success&doc=${encodeURIComponent(documentId)}`;
+  const cancel_url = `${origin}/pricing?checkout=cancel`;
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: [{ price, quantity: 1 }],
+    success_url,
+    cancel_url,
+    client_reference_id: userId,
+    metadata: {
+      user_id: userId,
+      document_id: documentId,
+      with_pdf: String(withPdf),
+      product: "materialize-and-run",
+    },
+  });
+
+  return session.url || null;
+}
+
+/* ------------------------ document lookup + pdf resolve ------------------------ */
 
 function normalizeExternalId(token: string) {
   const s = String(token || "").trim();
@@ -152,8 +204,6 @@ async function loadDocumentByIdOrExternalId(supabase: any, token: string) {
   return { doc: null as any, error: null as any };
 }
 
-/* --------------------------- pdf url resolution helper --------------------------- */
-
 function pickPdfCandidate(raw: any): string | null {
   if (!raw || typeof raw !== "object") return null;
 
@@ -167,10 +217,7 @@ function pickPdfCandidate(raw: any): string | null {
   return direct ? String(direct).trim() : null;
 }
 
-async function resolvePdfUrl(
-  supabase: any,
-  doc: any
-): Promise<{ pdfUrl: string | null; source: string }> {
+async function resolvePdfUrl(supabase: any, doc: any): Promise<{ pdfUrl: string | null; source: string }> {
   const direct =
     (typeof doc?.pdf_url === "string" && doc.pdf_url) ||
     (typeof doc?.pdfUrl === "string" && doc.pdfUrl) ||
@@ -181,32 +228,10 @@ async function resolvePdfUrl(
   if (direct && String(direct).trim()) return { pdfUrl: String(direct).trim(), source: "documents.*" };
 
   const rawCandidate = pickPdfCandidate(doc?.raw);
-  if (rawCandidate) {
-    if (isUuid(rawCandidate)) {
-      const r = await supabase
-        .from("documents")
-        .select("id, pdf, raw, url")
-        .eq("id", rawCandidate)
-        .maybeSingle();
-      if (r?.error) throw new Error(`PDF pointer lookup failed: ${r.error.message}`);
-      if (!r?.data) throw new Error(`PDF pointer document not found: ${rawCandidate}`);
-
-      const inner =
-        (typeof (r.data as any)?.pdf === "string" && (r.data as any).pdf) ||
-        pickPdfCandidate((r.data as any)?.raw) ||
-        (typeof (r.data as any)?.url === "string" && (r.data as any).url) ||
-        null;
-
-      return { pdfUrl: inner ? String(inner).trim() : null, source: "documents(raw->pointer)" };
-    }
-
-    return { pdfUrl: rawCandidate, source: "documents.raw" };
-  }
+  if (rawCandidate) return { pdfUrl: rawCandidate, source: "documents.raw" };
 
   return { pdfUrl: null, source: "none" };
 }
-
-/* ------------------------ pdf materialize via internal route ------------------------ */
 
 async function ensureMaterialized(baseUrl: string, documentId: string, ingestSecret: string, timeoutMs: number) {
   const u = new URL(`/api/documents/${documentId}/materialize`, baseUrl);
@@ -227,8 +252,6 @@ async function ensureMaterialized(baseUrl: string, documentId: string, ingestSec
 
   return payload;
 }
-
-/* ------------------------ deterministic (no-LLM) audit findings ------------------------ */
 
 function runDeterministicAudit(text: string, maxFindings: number) {
   const findings: any[] = [];
@@ -255,32 +278,8 @@ function runDeterministicAudit(text: string, maxFindings: number) {
     findings.push({
       title: "Key terms detected",
       severity: "info",
-      claim:
-        "The record contains one or more high-signal legal procedure terms. This is a keyword-level observation for research.",
+      claim: "The record contains one or more high-signal legal procedure terms. This is a keyword-level observation for research.",
       evidence: [{ bullets: flags.map((s) => `• ${s}`) }],
-    });
-  }
-
-  const dateHits = new Set<string>();
-  const iso = t.match(/\b(19|20)\d{2}-\d{2}-\d{2}\b/g) || [];
-  const us = t.match(/\b\d{1,2}\/\d{1,2}\/(19|20)\d{2}\b/g) || [];
-  [...iso, ...us].slice(0, 25).forEach((d) => dateHits.add(d));
-
-  if (dateHits.size) {
-    findings.push({
-      title: "Potential date markers",
-      severity: "info",
-      claim: "The record includes date-like strings that may help anchor a timeline (unverified).",
-      evidence: [{ bullets: Array.from(dateHits).slice(0, 15).map((d) => `• ${d}`) }],
-    });
-  }
-
-  if (len < 800) {
-    findings.push({
-      title: "Low extracted text volume",
-      severity: "warn",
-      claim: "Extracted text volume is low; the PDF may be scanned images or extraction may be incomplete.",
-      evidence: [{ bullets: [`Extracted length is only ${len.toLocaleString()} chars.`] }],
     });
   }
 
@@ -307,10 +306,12 @@ export async function POST(req: Request) {
         ""
     ).trim();
 
+    if (!documentToken) return json(400, { ok: false, phase: "input", error: "document_id is required" });
+
+    const withPdf = Boolean(body?.withPdf ?? body?.with_pdf ?? u.searchParams.get("withPdf") === "1");
+
     const kind = String(body?.kind ?? u.searchParams.get("kind") ?? "case_fact_audit").trim() || "case_fact_audit";
     const maxFindings = clamp(asInt(body?.maxFindings, 25), 1, 100);
-
-    if (!documentToken) return json(400, { ok: false, phase: "input", error: "document_id is required" });
 
     const supabase = createClient(mustEnv("NEXT_PUBLIC_SUPABASE_URL"), mustEnv("SUPABASE_SERVICE_ROLE_KEY"), {
       auth: { persistSession: false },
@@ -329,54 +330,26 @@ export async function POST(req: Request) {
 
     const documentId = String(doc.id);
 
-    // Authz: users can only run against their own docs
+    // User authz (system bypasses)
     if (auth.mode === "user" && doc.owner_id && doc.owner_id !== auth.userId) {
       return json(403, { ok: false, phase: "authz", error: "Forbidden" });
     }
 
-    // Stripe client (created INSIDE handler to avoid edge/bundle pitfalls)
-    const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), { apiVersion: "2025-12-15.clover" });
-
-    // Decide which price (BASIC=$50, PRO=$100)
-    const priceId =
-      kind === "case_fact_audit_pdf"
-        ? process.env.STRIPE_PRICE_PRO
-        : process.env.STRIPE_PRICE_BASIC;
-
-    if (!priceId) return json(500, { ok: false, phase: "stripe", error: "Missing STRIPE_PRICE_* env" });
-
-    // Paywall: if user request, force checkout session + return URL
+    // PAYWALL: only for real users (system is internal automation)
     if (auth.mode === "user") {
-      const site = mustEnv("NEXT_PUBLIC_SITE_URL").replace(/\/+$/, "");
+      const entitled = await isEntitled(supabase, auth.userId, withPdf);
+      if (!entitled) {
+        const origin = siteOriginFromEnv(req);
+        const checkoutUrl = await createCheckout(origin, withPdf, auth.userId, documentId);
 
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card"],
-        line_items: [{ price: priceId, quantity: 1 }],
-        success_url: `${site}/billing/success?document_id=${encodeURIComponent(documentId)}&kind=${encodeURIComponent(
-          kind
-        )}`,
-        cancel_url: `${site}/billing/cancel?document_id=${encodeURIComponent(documentId)}&kind=${encodeURIComponent(
-          kind
-        )}`,
-        metadata: {
-          document_id: documentId,
-          kind,
-          user_id: auth.userId,
-        },
-      });
+        if (!checkoutUrl) return json(500, { ok: false, phase: "stripe", error: "Failed to create checkout session" });
 
-      return json(402, {
-        ok: false,
-        phase: "payment_required",
-        requires_payment: true,
-        kind,
-        document_id: documentId,
-        checkout_url: session.url,
-      });
+        // 303 redirect for browsers + JSON fallback
+        return NextResponse.redirect(checkoutUrl, 303);
+      }
     }
 
-    // From here down: system mode continues to actually run materialize + audit
+    // Materialize + run (system or entitled user)
     const materializeCfg = body?.materialize || {};
     const chunkMaxChars = clamp(asInt(materializeCfg?.maxChars, 4000), 800, 12000);
     const maxChunks = clamp(asInt(materializeCfg?.maxChunks, 250), 1, 2000);
@@ -385,11 +358,9 @@ export async function POST(req: Request) {
     const resolved = await resolvePdfUrl(supabase, doc);
     const pdfUrl = resolved.pdfUrl;
 
-    if (!pdfUrl) {
-      return json(400, { ok: false, phase: "resolve_pdf_url", error: "No PDF URL resolved for document" });
-    }
+    if (!pdfUrl) return json(400, { ok: false, phase: "resolve_pdf_url", error: "No PDF URL resolved for document" });
 
-    const owner_id = mustEnv("SYSTEM_OWNER_ID").trim();
+    const owner_id = auth.mode === "user" ? auth.userId : mustEnv("SYSTEM_OWNER_ID").trim();
 
     const { data: created, error: createErr } = await supabase
       .from("analyses")
@@ -405,6 +376,7 @@ export async function POST(req: Request) {
           pdf_url: pdfUrl,
           pdf_resolved_from: resolved.source,
           document_identifier: documentToken,
+          with_pdf: withPdf,
         },
       })
       .select("id")
@@ -414,9 +386,7 @@ export async function POST(req: Request) {
 
     const analysisId = String(created.id);
 
-    // Materialize via internal route, then read chunks
-    const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || process.env.VERCEL_URL || "http://localhost:3000";
-    const origin = baseUrl.startsWith("http") ? baseUrl : `https://${baseUrl}`;
+    const origin = siteOriginFromEnv(req);
     const ingestSecret = process.env.INGEST_SECRET || "";
     if (!ingestSecret) throw new Error("Missing INGEST_SECRET for internal materialize call");
 
@@ -433,47 +403,21 @@ export async function POST(req: Request) {
     const text = normalizeText((chunksRes.data || []).map((r: any) => String(r.content || "")).join("\n\n"));
     if (!text) {
       await supabase.from("analyses").update({ status: "error", error: "Materialized but no text extracted" }).eq("id", analysisId);
-      return json(422, { ok: false, phase: "text", error: "Materialized but no text extracted", analysisId });
+      return json(422, { ok: false, phase: "materialize", error: "Materialized but no text extracted", analysisId });
     }
 
     const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
 
-    // Replace chunks deterministically
-    const { error: delErr } = await supabase.from("chunks").delete().eq("document_id", documentId);
-    if (delErr) {
-      await supabase.from("analyses").update({ status: "error", error: delErr.message }).eq("id", analysisId);
-      return json(500, { ok: false, phase: "delete_chunks", error: delErr.message, analysisId });
-    }
-
+    // Replace chunks (normalize to our chunking strategy)
+    await supabase.from("chunks").delete().eq("document_id", documentId);
     const rows = chunksText.map((content, i) => ({ document_id: documentId, chunk_index: i, content }));
-    const batchSize = 200;
 
-    for (let i = 0; i < rows.length; i += batchSize) {
-      const { error: insErr } = await supabase.from("chunks").insert(rows.slice(i, i + batchSize));
-      if (insErr) {
-        await supabase.from("analyses").update({ status: "error", error: insErr.message }).eq("id", analysisId);
-        return json(500, { ok: false, phase: "insert_chunks", error: insErr.message, analysisId });
-      }
+    for (let i = 0; i < rows.length; i += 200) {
+      const { error: insErr } = await supabase.from("chunks").insert(rows.slice(i, i + 200));
+      if (insErr) throw new Error(insErr.message);
     }
 
     const findings = runDeterministicAudit(text, maxFindings);
-
-    let findingsWriteMode: "table" | "meta" = "meta";
-    try {
-      const { error: fErr } = await supabase.from("findings").insert(
-        findings.map((f) => ({
-          analysis_id: analysisId,
-          title: f.title,
-          severity: f.severity,
-          claim: f.claim,
-          evidence: f.evidence,
-        }))
-      );
-      if (!fErr) findingsWriteMode = "table";
-    } catch {
-      findingsWriteMode = "meta";
-    }
-
     const elapsedMs = Date.now() - startedAt;
 
     await supabase
@@ -482,25 +426,16 @@ export async function POST(req: Request) {
         status: "completed",
         error: null,
         summary: `Extracted ${rows.length} chunks and generated ${findings.length} findings.`,
-        meta:
-          findingsWriteMode === "meta"
-            ? {
-                kind,
-                source: "materialize-and-run",
-                pdf_url: pdfUrl,
-                pdf_resolved_from: resolved.source,
-                elapsed_ms: elapsedMs,
-                chunk_count: rows.length,
-                findings,
-              }
-            : {
-                kind,
-                source: "materialize-and-run",
-                pdf_url: pdfUrl,
-                pdf_resolved_from: resolved.source,
-                elapsed_ms: elapsedMs,
-                chunk_count: rows.length,
-              },
+        meta: {
+          kind,
+          source: "materialize-and-run",
+          pdf_url: pdfUrl,
+          pdf_resolved_from: resolved.source,
+          elapsed_ms: elapsedMs,
+          chunk_count: rows.length,
+          with_pdf: withPdf,
+          findings,
+        },
       })
       .eq("id", analysisId);
 
@@ -514,7 +449,7 @@ export async function POST(req: Request) {
       pdf_resolved_from: resolved.source,
       chunk_count: rows.length,
       findingsCount: findings.length,
-      findingsWriteMode,
+      withPdf,
     });
   } catch (e: any) {
     return json(500, { ok: false, phase: "exception", error: e?.message || String(e) });
