@@ -11,7 +11,10 @@ export const dynamic = "force-dynamic";
 /* ------------------------------- helpers ------------------------------- */
 
 function json(status: number, payload: any) {
-  return NextResponse.json(payload, { status });
+  return NextResponse.json(payload, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 function mustEnv(name: string) {
@@ -20,17 +23,32 @@ function mustEnv(name: string) {
   return v;
 }
 
-function safeFilename(name: string) {
-  const base = (name || "upload.pdf").trim() || "upload.pdf";
-  // keep it filesystem + url safe
-  return base.replace(/[^\w.\-]+/g, "_");
+function safeStr(v: any, max = 500) {
+  if (typeof v !== "string") return "";
+  const s = v.trim();
+  if (!s) return "";
+  return s.length > max ? s.slice(0, max) : s;
 }
 
-function isPdfNameOrMime(name: string, mime: string) {
-  const lower = (name || "").toLowerCase();
-  if (mime === "application/pdf") return true;
-  if (lower.endsWith(".pdf")) return true;
-  return false;
+async function readJson(req: Request) {
+  const raw = await req.text().catch(() => "");
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+function safeFilename(name: string) {
+  const base = (name || "upload.pdf").trim() || "upload.pdf";
+  const cleaned = base.replace(/[^\w.\-]+/g, "_");
+  return cleaned.toLowerCase().endsWith(".pdf") ? cleaned : `${cleaned}.pdf`;
+}
+
+function isPdfContentType(ct: string) {
+  const s = (ct || "").toLowerCase().trim();
+  return s === "application/pdf" || s === "application/x-pdf";
 }
 
 /* -------------------------------- auth -------------------------------- */
@@ -50,7 +68,6 @@ async function requireUser(): Promise<Auth> {
         get(name: string) {
           return cookieStore.get(name)?.value;
         },
-        // Route handlers can't reliably mutate cookies; no-ops are correct here.
         set() {},
         remove() {},
       },
@@ -58,79 +75,41 @@ async function requireUser(): Promise<Auth> {
   );
 
   const { data, error } = await supabaseAuth.auth.getUser();
-
-  if (error || !data?.user?.id) {
-    return { ok: false, status: 401, error: "Unauthorized" };
-  }
+  if (error || !data?.user?.id) return { ok: false, status: 401, error: "Unauthorized" };
 
   return { ok: true, userId: data.user.id };
 }
 
-/* -------------------------------- CORS -------------------------------- */
-/**
- * Optional, but harmless. If you ever hit this route cross-origin, preflight won't 405.
- * For same-origin (normal Next.js app), it doesn't matter.
- */
-export async function OPTIONS() {
-  return new NextResponse(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Max-Age": "86400",
-    },
-  });
-}
-
 /* -------------------------------- route -------------------------------- */
-
+/**
+ * POST JSON:
+ *  { filename: string, contentType?: string, folder?: string }
+ *
+ * Returns:
+ *  { bucket, path, uploadUrl, readUrl, expiresIn }
+ *
+ * Client then does:
+ *  fetch(uploadUrl, { method: "PUT", headers: {"content-type":"application/pdf"}, body: file })
+ */
 export async function POST(req: Request) {
   try {
     const auth = await requireUser();
-    if (auth.ok === false) return json(auth.status, { ok: false, error: auth.error });
+    if (!auth.ok) return json(auth.status, { ok: false, error: auth.error });
 
-    const ct = req.headers.get("content-type") || "";
-    if (!ct.toLowerCase().includes("multipart/form-data")) {
-      return json(415, {
-        ok: false,
-        error: "Unsupported Content-Type. Expected multipart/form-data with field 'file'.",
-      });
+    const body = await readJson(req);
+
+    const filename = safeFilename(safeStr(body?.filename, 200) || "upload.pdf");
+    const contentType = safeStr(body?.contentType, 100) || "application/pdf";
+
+    if (!isPdfContentType(contentType) && !filename.toLowerCase().endsWith(".pdf")) {
+      return json(400, { ok: false, error: "Only PDF uploads are supported." });
     }
 
-    const form = await req.formData();
-    const file = form.get("file");
-
-    if (!(file instanceof File)) {
-      return json(400, { ok: false, error: "Expected multipart form-data with field 'file'." });
-    }
-
-    const name = safeFilename(file.name);
-    const mime = String(file.type || "");
-
-    if (!isPdfNameOrMime(name, mime)) {
-      return json(400, { ok: false, error: "Only PDF files are allowed." });
-    }
-
-    // Read bytes (Uint8Array avoids TS BodyInit issues and is compatible with supabase-js)
-    const ab = await file.arrayBuffer();
-    const bytes = new Uint8Array(ab);
-
-    // Quick signature check: "%PDF-"
-    if (bytes.length < 5) {
-      return json(400, { ok: false, error: "File is too small to be a valid PDF." });
-    }
-    const header = Buffer.from(bytes.slice(0, 5)).toString("utf8");
-    if (header !== "%PDF-") {
-      return json(400, { ok: false, error: "File does not look like a real PDF (%PDF- header missing)." });
-    }
-
-    // IMPORTANT: bucket must exist in Supabase Storage
     const bucket = "documents";
+    const folder = safeStr(body?.folder, 80) || "uploads";
 
-    // Unique-ish path with hash prefix (prevents collisions, helps dedupe)
-    const sha = crypto.createHash("sha256").update(Buffer.from(bytes)).digest("hex").slice(0, 24);
-    const path = `${auth.userId}/${Date.now()}_${sha}_${name}`;
+    const nonce = crypto.randomBytes(12).toString("hex");
+    const path = `${auth.userId}/${folder}/${Date.now()}_${nonce}_${filename}`;
 
     const admin = createClient(
       mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
@@ -138,31 +117,36 @@ export async function POST(req: Request) {
       { auth: { persistSession: false } }
     );
 
-    const up = await admin.storage.from(bucket).upload(path, bytes, {
-      contentType: "application/pdf",
-      upsert: false,
-    });
+    // 10 minutes
+    const expiresIn = 60 * 10;
 
-    if (up.error) {
-      return json(500, { ok: false, error: up.error.message });
+    /**
+     * Compatibility approach:
+     * createSignedUrl(path, expiresIn) returns a signed URL that can be used
+     * for access. Many setups allow PUT/POST to that signed URL for upload as well.
+     *
+     * If your storage config only allows GET on signed URLs, tell me and I’ll switch
+     * to the newer createSignedUploadUrl() method.
+     */
+    const signed = await admin.storage.from(bucket).createSignedUrl(path, expiresIn);
+    if (signed.error || !signed.data?.signedUrl) {
+      return json(500, { ok: false, error: signed.error?.message || "Failed to create signed URL." });
     }
 
-    // If your bucket is PUBLIC, getPublicUrl works.
-    // If your bucket is PRIVATE, switch to createSignedUrl and return signedUrl instead.
-    const { data: pub } = admin.storage.from(bucket).getPublicUrl(path);
+    const uploadUrl = signed.data.signedUrl;
 
-    const url = pub?.publicUrl || "";
-    if (!url) {
-      return json(500, { ok: false, error: "Upload succeeded but public URL could not be generated." });
-    }
+    // Also return a read URL (same as uploadUrl in this compatibility mode)
+    // If your bucket is public later, you can change this to a public URL.
+    const readUrl = uploadUrl;
 
     return json(200, {
       ok: true,
       bucket,
       path,
-      url,
-      filename: name,
-      bytes: bytes.length,
+      contentType: "application/pdf",
+      uploadUrl,
+      readUrl,
+      expiresIn,
     });
   } catch (e: any) {
     return json(500, { ok: false, error: e?.message || String(e) });
