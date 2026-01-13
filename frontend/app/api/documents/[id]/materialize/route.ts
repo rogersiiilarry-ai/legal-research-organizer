@@ -1,9 +1,10 @@
-// frontend/app/api/documents/[id]/materialize/route.ts
+﻿// frontend/app/api/documents/[id]/materialize/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
 import { createRequire } from "module";
+import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 
 export const runtime = "nodejs";
 
@@ -170,21 +171,7 @@ async function fetchBinaryPdf(url: string, timeoutMs: number) {
   } finally {
     clearTimeout(t);
   }
-}
-
-async function parsePdf(buffer: Buffer) {
-  const req = createRequire(import.meta.url);
-  let mod: any;
-  try {
-    mod = req("pdf-parse");
-  } catch (e: any) {
-    throw new Error(`Failed to load pdf-parse. Run: npm i pdf-parse. Last error: ${e?.message || e}`);
-  }
-  const fn = mod?.default ?? mod;
-  if (typeof fn !== "function") throw new Error("pdf-parse did not export a callable function");
-  return await fn(buffer);
-}
-
+}
 /* ---------------------- resolve PDF URL from document ---------------------- */
 
 function pickPdfCandidate(raw: any): string {
@@ -223,7 +210,34 @@ async function resolvePdfUrl(admin: any, doc: any) {
 }
 
 /* ---------------------------------- route ---------------------------------- */
+/* --------------------------- pdfjs text extraction helper --------------------------- */
+/**
+ * Extracts text from a PDF using pdfjs-dist legacy build (server-side).
+ * Returns a single concatenated string (pages separated by blank lines).
+ */
+async function extractPdfText(pdfBytes: Uint8Array): Promise<string> {
+  // In Node (Next.js route handlers), pdfjs works without setting workerSrc.
+  // @ts-ignore
+  const loadingTask = pdfjs.getDocument({ data: pdfBytes });
+  // @ts-ignore
+  const doc = await loadingTask.promise;
 
+  let out = "";
+  for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+    const page = await doc.getPage(pageNum);
+    const tc = await page.getTextContent();
+
+    const pageText = (tc.items || [])
+      .map((it: any) => (typeof it?.str === "string" ? it.str : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (pageText) out += (out ? "\n\n" : "") + pageText;
+  }
+
+  return out;
+}
 export async function POST(req: Request, ctx: { params: { id: string } }) {
   try {
     const auth = await requireUser();
@@ -258,9 +272,8 @@ export async function POST(req: Request, ctx: { params: { id: string } }) {
     if (pdfBuf.length > maxBytes) {
       return json(413, { ok: false, phase: "pdf_size", error: `PDF too large (${pdfBuf.length} bytes)` });
     }
-
-    const parsed = await parsePdf(pdfBuf);
-    const text = normalizeText(parsed?.text || "");
+    const extracted = await extractPdfText(pdfBuf);
+    const text = normalizeText(extracted || "");
     if (!text) return json(422, { ok: false, phase: "parse_pdf", error: "Parsed but no text extracted" });
 
     const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
@@ -291,3 +304,9 @@ export async function POST(req: Request, ctx: { params: { id: string } }) {
     return json(500, { ok: false, phase: "exception", error: e?.message || String(e) });
   }
 }
+
+
+
+
+
+
