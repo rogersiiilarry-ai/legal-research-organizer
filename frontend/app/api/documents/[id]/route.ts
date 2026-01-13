@@ -1,11 +1,12 @@
-﻿// frontend/app/api/documents/[id]/materialize/route.ts
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-// IMPORTANT: do not import pdf-parse. Use pdfjs directly.
-import * as pdfjs from "pdfjs-dist/legacy/build/pdf.js";
+// pdfjs ESM legacy build (Node-safe)
+import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 
 export const runtime = "nodejs";
+
+/* ----------------------------- helpers ----------------------------- */
 
 function json(status: number, payload: any) {
   return NextResponse.json(payload, { status });
@@ -31,7 +32,7 @@ function asInt(v: any, fallback: number) {
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
 }
 
-/** system-only gate (consistent with your other system routes) */
+/** system-only gate */
 function requireSystem(req: Request) {
   const provided = req.headers.get("x-ingest-secret") || "";
   const expected = process.env.INGEST_SECRET || "";
@@ -57,12 +58,15 @@ function chunkText(text: string, maxChars: number, maxChunks: number) {
 
   while (i < t.length && chunks.length < maxChunks) {
     const end = Math.min(t.length, i + maxChars);
-
-    // try to break on a boundary
     let sliceEnd = end;
+
     const window = t.slice(i, end);
     const lastBreak =
-      Math.max(window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), window.lastIndexOf(". "));
+      Math.max(
+        window.lastIndexOf("\n\n"),
+        window.lastIndexOf("\n"),
+        window.lastIndexOf(". ")
+      );
 
     if (lastBreak > Math.floor(maxChars * 0.6)) {
       sliceEnd = i + lastBreak + 1;
@@ -70,7 +74,6 @@ function chunkText(text: string, maxChars: number, maxChunks: number) {
 
     const piece = normalizeText(t.slice(i, sliceEnd));
     if (piece) chunks.push(piece);
-
     i = sliceEnd;
   }
 
@@ -83,7 +86,7 @@ async function fetchPdfBytes(url: string, timeoutMs: number) {
 
   try {
     const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error(`Failed to fetch PDF: ${res.status} ${res.statusText}`);
+    if (!res.ok) throw new Error(`Failed to fetch PDF: ${res.status}`);
     const buf = await res.arrayBuffer();
     return new Uint8Array(buf);
   } finally {
@@ -92,8 +95,7 @@ async function fetchPdfBytes(url: string, timeoutMs: number) {
 }
 
 async function extractPdfText(pdfBytes: Uint8Array) {
-  // Ensure worker is disabled for node usage
-  // (legacy build generally works without a worker in node)
+  // Disable worker explicitly for Node
   // @ts-ignore
   if (pdfjs.GlobalWorkerOptions) {
     // @ts-ignore
@@ -105,6 +107,7 @@ async function extractPdfText(pdfBytes: Uint8Array) {
   const doc = await loadingTask.promise;
 
   let out = "";
+
   for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
     const page = await doc.getPage(pageNum);
     const tc = await page.getTextContent();
@@ -119,6 +122,8 @@ async function extractPdfText(pdfBytes: Uint8Array) {
   return normalizeText(out);
 }
 
+/* ------------------------------- POST ------------------------------- */
+
 export async function POST(
   req: Request,
   ctx: { params: Promise<{ id: string }> | { id: string } }
@@ -127,60 +132,59 @@ export async function POST(
     const auth = requireSystem(req);
     if (!auth.ok) return json(auth.status, { ok: false, error: auth.error });
 
-    const supabaseUrl = mustEnv("NEXT_PUBLIC_SUPABASE_URL");
-    const serviceKey = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-    const supabase = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
+    const supabase = createClient(
+      mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+      mustEnv("SUPABASE_SERVICE_ROLE_KEY"),
+      { auth: { persistSession: false } }
+    );
 
     const params = await ctx.params;
     const documentId = asUuid(params?.id);
-    if (!documentId) return json(400, { ok: false, error: "Invalid document id (UUID required)" });
+    if (!documentId) {
+      return json(400, { ok: false, error: "Invalid document id (UUID required)" });
+    }
 
     const url = new URL(req.url);
     const maxChars = Math.max(500, Math.min(12000, asInt(url.searchParams.get("maxChars"), 4000)));
     const maxChunks = Math.max(1, Math.min(2000, asInt(url.searchParams.get("maxChunks"), 250)));
     const timeoutMs = Math.max(1000, Math.min(120000, asInt(url.searchParams.get("timeoutMs"), 45000)));
 
-    // Load document row to find PDF url
     const { data: docRow, error: docErr } = await supabase
       .from("documents")
-      .select("id, raw, pdf, url")
+      .select("id, raw, pdf")
       .eq("id", documentId)
       .maybeSingle();
 
-    if (docErr) return json(500, { ok: false, phase: "load_document", error: docErr.message });
-    if (!docRow) return json(404, { ok: false, phase: "load_document", error: "Document not found" });
+    if (docErr) return json(500, { ok: false, error: docErr.message });
+    if (!docRow) return json(404, { ok: false, error: "Document not found" });
 
     const pdfUrl =
       (typeof (docRow as any)?.pdf === "string" && (docRow as any).pdf) ||
+      (typeof (docRow as any)?.raw?.pdf_url === "string" && (docRow as any).raw.pdf_url) ||
       (typeof (docRow as any)?.raw?.pdf === "string" && (docRow as any).raw.pdf) ||
       null;
 
     if (!pdfUrl) {
       return json(400, {
         ok: false,
-        phase: "input",
-        error: "No pdf url found on document (expected documents.pdf or documents.raw.pdf)",
+        error: "No PDF URL found (expected documents.pdf or documents.raw.pdf_url)",
       });
     }
 
-    // Fetch + extract
     const pdfBytes = await fetchPdfBytes(pdfUrl, timeoutMs);
     const extracted = await extractPdfText(pdfBytes);
 
     if (!extracted) {
       return json(200, {
         ok: true,
-        phase: "extracted_empty",
+        phase: "empty",
         document_id: documentId,
-        pdfUrl,
-        extracted_chars: 0,
         chunk_count: 0,
       });
     }
 
     const chunks = chunkText(extracted, maxChars, maxChunks);
 
-    // Replace existing chunks for this document (idempotent)
     await supabase.from("chunks").delete().eq("document_id", documentId);
 
     const rows = chunks.map((content, idx) => ({
@@ -190,20 +194,17 @@ export async function POST(
     }));
 
     const { error: insErr } = await supabase.from("chunks").insert(rows);
-    if (insErr) return json(500, { ok: false, phase: "insert_chunks", error: insErr.message });
+    if (insErr) return json(500, { ok: false, error: insErr.message });
 
     return json(200, {
       ok: true,
-      phase: "done",
       document_id: documentId,
-      pdfUrl,
       extracted_chars: extracted.length,
       chunk_count: rows.length,
       maxChars,
       maxChunks,
     });
   } catch (e: any) {
-    return json(500, { ok: false, phase: "exception", error: e?.message || String(e) });
+    return json(500, { ok: false, error: e?.message || String(e) });
   }
 }
-

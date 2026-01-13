@@ -1,19 +1,25 @@
 {
-    "name":  "a",
-    "version":  "0.1.0",
-    "private":  true,
-    "scripts":  {
-                    "dev":  "next dev",
-                    "build":  "next build",
-                    "start":  "next start",
-                    "lint":  "next lint"
-                },
-    "dependencies":  {
-                         "next":  "14.2.3",
-                         "react":  "18.3.1",
-                         "react-dom":  "18.3.1"
-                     },
-    "devDependencies":  {
-                            "playwright":  "^1.57.0"
-                        }
+    "name": "a",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+        "dev": "next dev",
+        "build": "next build",
+        "start": "next start",
+        "lint": "next lint"
+    },
+    "dependencies": {
+        "@supabase/ssr": "^0.8.0",
+        "@supabase/supabase-js": "^2.90.1",
+        "next": "14.2.3",
+        "pdf-lib": "^1.17.1",
+        "pdfjs-dist": "^5.4.530",
+        "react": "18.3.1",
+        "react-dom": "18.3.1"
+    },
+    "devDependencies": {
+        "@types/react": "19.2.8",
+        "playwright": "^1.57.0",
+        "typescript": "5.9.3"
+    }
 }
