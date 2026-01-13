@@ -1,14 +1,9 @@
-﻿import Stripe from "stripe";
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2023-10-16",
-});
-// frontend/app/api/audit/run/materialize-and-run/route.ts
+﻿// frontend/app/api/audit/run/materialize-and-run/route.ts
+import Stripe from "stripe";
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
-import { createRequire } from "module";
 
 export const runtime = "nodejs";
 
@@ -90,10 +85,6 @@ function isUuid(v: string) {
   );
 }
 
-function isHttpUrl(v: string) {
-  return /^https?:\/\//i.test(v || "");
-}
-
 /* ---------------------------------- auth ---------------------------------- */
 
 type AuthResult =
@@ -130,13 +121,8 @@ async function requireSystemOrUser(req: Request): Promise<AuthResult> {
   return { ok: true, mode: "user", userId: data.user.id };
 }
 
-/* ------------------------ document lookup (FIX) ------------------------ */
-/**
- * Accept:
- *  - documents.id UUID
- *  - documents.external_id values:
- *      "url:....", "uri:....", or raw 40-hex => normalize => "url:<hex>"
- */
+/* ------------------------ document lookup (id or external_id) ------------------------ */
+
 function normalizeExternalId(token: string) {
   const s = String(token || "").trim();
   if (!s) return "";
@@ -152,14 +138,12 @@ async function loadDocumentByIdOrExternalId(supabase: any, token: string) {
 
   const sel = "id, owner_id, raw, title, external_id";
 
-  // 1) Try UUID => documents.id
   if (isUuid(id)) {
     const r = await supabase.from("documents").select(sel).eq("id", id).maybeSingle();
     if (r.error) return { doc: null as any, error: r.error.message };
     if (r.data) return { doc: r.data, error: null as any };
   }
 
-  // 2) Try normalized external_id
   const ext = normalizeExternalId(id);
   const r2 = await supabase.from("documents").select(sel).eq("external_id", ext).maybeSingle();
   if (r2.error) return { doc: null as any, error: r2.error.message };
@@ -168,21 +152,11 @@ async function loadDocumentByIdOrExternalId(supabase: any, token: string) {
   return { doc: null as any, error: null as any };
 }
 
-/* --------------------------- pdf fetch + parse -------------------------- */
-/**
- * IMPORTANT:
- * - Do NOT reject by content-type, because many gov sites return HTML interstitials to bots.
- * - Only trust the first 5 bytes (%PDF-) as the definitive PDF check.
- */
-// NOTE: pdf text materialization is handled by /api/documents/[id]/materialize (pdfjs-dist).
-// Any prior pdf-parse helper was removed to keep the deployment dependency-free.
-
 /* --------------------------- pdf url resolution helper --------------------------- */
 
 function pickPdfCandidate(raw: any): string | null {
   if (!raw || typeof raw !== "object") return null;
 
-  // common shapes we've seen in your pipeline
   const direct =
     (typeof raw.pdf_url === "string" && raw.pdf_url) ||
     (typeof raw.pdfUrl === "string" && raw.pdfUrl) ||
@@ -193,12 +167,10 @@ function pickPdfCandidate(raw: any): string | null {
   return direct ? String(direct).trim() : null;
 }
 
-
 async function resolvePdfUrl(
   supabase: any,
   doc: any
 ): Promise<{ pdfUrl: string | null; source: string }> {
-  // 1) direct doc fields
   const direct =
     (typeof doc?.pdf_url === "string" && doc.pdf_url) ||
     (typeof doc?.pdfUrl === "string" && doc.pdfUrl) ||
@@ -208,12 +180,14 @@ async function resolvePdfUrl(
 
   if (direct && String(direct).trim()) return { pdfUrl: String(direct).trim(), source: "documents.*" };
 
-  // 2) raw object
   const rawCandidate = pickPdfCandidate(doc?.raw);
   if (rawCandidate) {
-    // If it's a UUID pointer, dereference to another documents row
     if (isUuid(rawCandidate)) {
-      const r = await supabase.from("documents").select("id, pdf, raw, url").eq("id", rawCandidate).maybeSingle();
+      const r = await supabase
+        .from("documents")
+        .select("id, pdf, raw, url")
+        .eq("id", rawCandidate)
+        .maybeSingle();
       if (r?.error) throw new Error(`PDF pointer lookup failed: ${r.error.message}`);
       if (!r?.data) throw new Error(`PDF pointer document not found: ${rawCandidate}`);
 
@@ -232,33 +206,8 @@ async function resolvePdfUrl(
   return { pdfUrl: null, source: "none" };
 }
 
-/* --------------------------- pdf binary fetch helper --------------------------- */
-async function fetchBinaryPdf(url: string, timeoutMs: number): Promise<Uint8Array> {
-  const ctrl = new AbortController();
-  const ms = Math.max(1000, Math.min(120000, Number(timeoutMs) || 45000));
-  const t = setTimeout(() => ctrl.abort(), ms);
-
-  try {
-    const res = await fetch(url, { signal: ctrl.signal, redirect: "follow" as any });
-    if (!res.ok) throw new Error(`Failed to fetch PDF: ${res.status} ${res.statusText}`);
-
-    const ab = await res.arrayBuffer();
-    const bytes = new Uint8Array(ab);
-
-    // Hard check: PDF magic header
-    if (bytes.length >= 5) {
-      const sig = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]);
-      if (sig !== "%PDF-") {
-        throw new Error("Fetched content is not a PDF (%PDF- header missing)");
-      }
-    }
-
-    return bytes;
-  } finally {
-    clearTimeout(t);
-  }
-}
 /* ------------------------ pdf materialize via internal route ------------------------ */
+
 async function ensureMaterialized(baseUrl: string, documentId: string, ingestSecret: string, timeoutMs: number) {
   const u = new URL(`/api/documents/${documentId}/materialize`, baseUrl);
   u.searchParams.set("timeoutMs", String(timeoutMs || 45000));
@@ -276,13 +225,11 @@ async function ensureMaterialized(baseUrl: string, documentId: string, ingestSec
     throw new Error(payload?.error || `Materialize failed: ${res.status} ${res.statusText}`);
   }
 
-  return payload; // { ok, chunk_count, ... }
+  return payload;
 }
+
 /* ------------------------ deterministic (no-LLM) audit findings ------------------------ */
-/**
- * Produce a small set of deterministic, research-only findings from extracted text.
- * This is intentionally conservative: it does NOT provide legal advice.
- */
+
 function runDeterministicAudit(text: string, maxFindings: number) {
   const findings: any[] = [];
   const limit = Math.max(1, Math.min(50, Number(maxFindings) || 12));
@@ -290,7 +237,6 @@ function runDeterministicAudit(text: string, maxFindings: number) {
   const t = String(text || "");
   const len = t.length;
 
-  // Basic extraction health
   findings.push({
     title: "Record text extracted",
     severity: "info",
@@ -298,30 +244,23 @@ function runDeterministicAudit(text: string, maxFindings: number) {
     evidence: [{ bullets: [`Extracted character length: ${len.toLocaleString()}`] }],
   });
 
-  // Simple red-flag checks (deterministic)
-  const hasMiranda = /\bmiranda\b/i.test(t);
-  const hasWarrant = /\bwarrant\b/i.test(t);
-  const hasArraign = /\barraign/i.test(t);
-  const hasPlea = /\bplea\b/i.test(t);
-  const hasBond = /\bbond\b/i.test(t);
-
   const flags: string[] = [];
-  if (hasMiranda) flags.push("Miranda term detected");
-  if (hasWarrant) flags.push("Warrant term detected");
-  if (hasArraign) flags.push("Arraignment term detected");
-  if (hasPlea) flags.push("Plea term detected");
-  if (hasBond) flags.push("Bond term detected");
+  if (/\bmiranda\b/i.test(t)) flags.push("Miranda term detected");
+  if (/\bwarrant\b/i.test(t)) flags.push("Warrant term detected");
+  if (/\barraign/i.test(t)) flags.push("Arraignment term detected");
+  if (/\bplea\b/i.test(t)) flags.push("Plea term detected");
+  if (/\bbond\b/i.test(t)) flags.push("Bond term detected");
 
   if (flags.length) {
     findings.push({
       title: "Key terms detected",
       severity: "info",
-      claim: "The record contains one or more high-signal legal procedure terms. This is a keyword-level observation for research.",
+      claim:
+        "The record contains one or more high-signal legal procedure terms. This is a keyword-level observation for research.",
       evidence: [{ bullets: flags.map((s) => `• ${s}`) }],
     });
   }
 
-  // Dates (very rough): look for YYYY-MM-DD or MM/DD/YYYY patterns
   const dateHits = new Set<string>();
   const iso = t.match(/\b(19|20)\d{2}-\d{2}-\d{2}\b/g) || [];
   const us = t.match(/\b\d{1,2}\/\d{1,2}\/(19|20)\d{2}\b/g) || [];
@@ -336,7 +275,6 @@ function runDeterministicAudit(text: string, maxFindings: number) {
     });
   }
 
-  // Very basic length sanity
   if (len < 800) {
     findings.push({
       title: "Low extracted text volume",
@@ -346,9 +284,9 @@ function runDeterministicAudit(text: string, maxFindings: number) {
     });
   }
 
-  // Cap
   return findings.slice(0, limit);
 }
+
 /* ---------------------------------- route ---------------------------------- */
 
 export async function POST(req: Request) {
@@ -378,7 +316,6 @@ export async function POST(req: Request) {
       auth: { persistSession: false },
     });
 
-    // FIX: load by UUID OR external_id token
     const { doc, error: loadErr } = await loadDocumentByIdOrExternalId(supabase, documentToken);
     if (loadErr) return json(500, { ok: false, phase: "load_document", error: loadErr });
     if (!doc) {
@@ -392,22 +329,67 @@ export async function POST(req: Request) {
 
     const documentId = String(doc.id);
 
-    // Authz
+    // Authz: users can only run against their own docs
     if (auth.mode === "user" && doc.owner_id && doc.owner_id !== auth.userId) {
       return json(403, { ok: false, phase: "authz", error: "Forbidden" });
     }
 
+    // Stripe client (created INSIDE handler to avoid edge/bundle pitfalls)
+    const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), { apiVersion: "2025-12-15.clover" });
+
+    // Decide which price (BASIC=$50, PRO=$100)
+    const priceId =
+      kind === "case_fact_audit_pdf"
+        ? process.env.STRIPE_PRICE_PRO
+        : process.env.STRIPE_PRICE_BASIC;
+
+    if (!priceId) return json(500, { ok: false, phase: "stripe", error: "Missing STRIPE_PRICE_* env" });
+
+    // Paywall: if user request, force checkout session + return URL
+    if (auth.mode === "user") {
+      const site = mustEnv("NEXT_PUBLIC_SITE_URL").replace(/\/+$/, "");
+
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        line_items: [{ price: priceId, quantity: 1 }],
+        success_url: `${site}/billing/success?document_id=${encodeURIComponent(documentId)}&kind=${encodeURIComponent(
+          kind
+        )}`,
+        cancel_url: `${site}/billing/cancel?document_id=${encodeURIComponent(documentId)}&kind=${encodeURIComponent(
+          kind
+        )}`,
+        metadata: {
+          document_id: documentId,
+          kind,
+          user_id: auth.userId,
+        },
+      });
+
+      return json(402, {
+        ok: false,
+        phase: "payment_required",
+        requires_payment: true,
+        kind,
+        document_id: documentId,
+        checkout_url: session.url,
+      });
+    }
+
+    // From here down: system mode continues to actually run materialize + audit
     const materializeCfg = body?.materialize || {};
     const chunkMaxChars = clamp(asInt(materializeCfg?.maxChars, 4000), 800, 12000);
     const maxChunks = clamp(asInt(materializeCfg?.maxChunks, 250), 1, 2000);
     const timeoutMs = clamp(asInt(materializeCfg?.timeoutMs, 45000), 5000, 120000);
 
-    // Resolve PDF URL
     const resolved = await resolvePdfUrl(supabase, doc);
     const pdfUrl = resolved.pdfUrl;
 
-    // Create analysis row
-    const owner_id = auth.mode === "user" ? auth.userId : mustEnv("SYSTEM_OWNER_ID").trim();
+    if (!pdfUrl) {
+      return json(400, { ok: false, phase: "resolve_pdf_url", error: "No PDF URL resolved for document" });
+    }
+
+    const owner_id = mustEnv("SYSTEM_OWNER_ID").trim();
 
     const { data: created, error: createErr } = await supabase
       .from("analyses")
@@ -432,54 +414,31 @@ export async function POST(req: Request) {
 
     const analysisId = String(created.id);
 
-    // Fetch + parse PDF
-    if (!pdfUrl) {
-      return NextResponse.json(
-        { ok: false, error: "No PDF URL resolved for document", phase: "resolve_pdf_url" },
-        { status: 400 }
-      );
-    }
-
-    const pdfBuf = await fetchBinaryPdf(pdfUrl, timeoutMs);
-    const maxBytes = 25 * 1024 * 1024;
-    if (pdfBuf.length > maxBytes) {
-      await supabase
-        .from("analyses")
-        .update({ status: "error", error: `PDF too large (${pdfBuf.length} bytes)` })
-        .eq("id", analysisId);
-      return json(413, { ok: false, phase: "pdf_size", error: `PDF too large (${pdfBuf.length} bytes)`, analysisId });
-    }
-    // Materialize PDF to chunks using pdfjs route, then load chunks as text
+    // Materialize via internal route, then read chunks
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || process.env.VERCEL_URL || "http://localhost:3000";
     const origin = baseUrl.startsWith("http") ? baseUrl : `https://${baseUrl}`;
     const ingestSecret = process.env.INGEST_SECRET || "";
     if (!ingestSecret) throw new Error("Missing INGEST_SECRET for internal materialize call");
 
-    await ensureMaterialized(origin, doc.id, ingestSecret, timeoutMs);
+    await ensureMaterialized(origin, documentId, ingestSecret, timeoutMs);
 
     const chunksRes = await supabase
       .from("chunks")
       .select("chunk_index, content")
-      .eq("document_id", doc.id)
+      .eq("document_id", documentId)
       .order("chunk_index", { ascending: true });
 
     if (chunksRes.error) throw new Error(`Failed to load chunks: ${chunksRes.error.message}`);
 
     const text = normalizeText((chunksRes.data || []).map((r: any) => String(r.content || "")).join("\n\n"));
     if (!text) {
-      await supabase
-        .from("analyses")
-        .update({ status: "error", error: "Materialized but no text extracted" })
-        .eq("id", analysisId);
-
-      return NextResponse.json(
-        { ok: false, error: "Materialized but no text extracted" },
-        { status: 422, headers: { "Cache-Control": "no-store" } }
-      );
+      await supabase.from("analyses").update({ status: "error", error: "Materialized but no text extracted" }).eq("id", analysisId);
+      return json(422, { ok: false, phase: "text", error: "Materialized but no text extracted", analysisId });
     }
-const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
 
-    // Replace chunks
+    const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
+
+    // Replace chunks deterministically
     const { error: delErr } = await supabase.from("chunks").delete().eq("document_id", documentId);
     if (delErr) {
       await supabase.from("analyses").update({ status: "error", error: delErr.message }).eq("id", analysisId);
@@ -497,10 +456,8 @@ const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
       }
     }
 
-    // Generate findings
     const findings = runDeterministicAudit(text, maxFindings);
 
-    // Best-effort write to findings table; fallback to meta.findings
     let findingsWriteMode: "table" | "meta" = "meta";
     try {
       const { error: fErr } = await supabase.from("findings").insert(
@@ -563,17 +520,3 @@ const chunksText = chunkText(text, chunkMaxChars).slice(0, maxChunks);
     return json(500, { ok: false, phase: "exception", error: e?.message || String(e) });
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
