@@ -1,18 +1,26 @@
 ﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
 
 function s(v: any) {
   return typeof v === "string" ? v.trim() : "";
+}
+
+function mustEnv(name: string) {
+  const v = (process.env as any)[name];
+  if (!v) throw new Error(`Missing ${name}`);
+  return v as string;
 }
 
 export default function AuditClient() {
   const [documentToken, setDocumentToken] = useState("");
   const [tier, setTier] = useState<"basic" | "pro">("pro");
   const [msg, setMsg] = useState<string>("");
+  const [busy, setBusy] = useState(false);
 
   const withPdf = tier === "pro";
-  const canGo = useMemo(() => Boolean(s(documentToken)), [documentToken]);
+  const canGo = useMemo(() => Boolean(s(documentToken)) && !busy, [documentToken, busy]);
 
   useEffect(() => {
     const u = new URL(window.location.href);
@@ -21,17 +29,68 @@ export default function AuditClient() {
     if (checkout === "cancel") setMsg("Checkout canceled.");
   }, []);
 
-  function onMaterialize() {
+  async function onMaterialize() {
     const doc = s(documentToken);
-    if (!doc) return;
+    if (!doc || busy) return;
 
-    const qs = new URLSearchParams({
-      mode: "materialize-and-run",
-      document_id: doc,
-      withPdf: withPdf ? "1" : "0",
-    });
+    setBusy(true);
+    setMsg("");
 
-    window.location.href = `/api/audit/run?${qs.toString()}`;
+    try {
+      // Create a browser Supabase client (reads local session)
+      const supabase = createClient(
+        mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+        mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+      );
+
+      const { data } = await supabase.auth.getSession();
+      const token = data?.session?.access_token;
+
+      if (!token) {
+        window.location.href = "/login";
+        return;
+      }
+
+      const res = await fetch("/api/audit/run/materialize-and-run", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          document_id: doc,
+          withPdf,
+        }),
+      });
+
+      const payload = await res.json().catch(() => ({} as any));
+
+      // Not logged in / token rejected
+      if (res.status === 401) {
+        window.location.href = "/login";
+        return;
+      }
+
+      // Paywall => redirect to Stripe
+      if (res.status === 402 && payload?.checkout_url) {
+        window.location.href = payload.checkout_url;
+        return;
+      }
+
+      // Other errors
+      if (!res.ok || payload?.ok === false) {
+        setMsg(payload?.error || `Request failed (${res.status})`);
+        return;
+      }
+
+      // Success
+      setMsg(`Done. Analysis: ${payload?.analysisId || "(unknown)"}`);
+    } catch (e: any) {
+      setMsg(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -58,7 +117,7 @@ export default function AuditClient() {
       </div>
 
       <button style={{ marginTop: 16 }} onClick={onMaterialize} disabled={!canGo}>
-        Materialize
+        {busy ? "Working..." : "Materialize"}
       </button>
 
       {msg ? <div style={{ marginTop: 12 }}>{msg}</div> : null}
