@@ -1,9 +1,9 @@
-﻿import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
 /* ----------------------------- path helpers ----------------------------- */
 
-function isPublicPath(pathname) {
+function isPublicPath(pathname: string) {
   return (
     pathname === "/" ||
     pathname === "/login" ||
@@ -13,30 +13,42 @@ function isPublicPath(pathname) {
   );
 }
 
-function isPublicApi(pathname) {
+function isPublicApi(pathname: string) {
   // No auth at all
   return pathname === "/api/health" || pathname.startsWith("/api/auth/");
 }
 
-function isIngestPath(pathname) {
+function isIngestPath(pathname: string) {
+  // System secret ONLY
   return pathname.startsWith("/api/ingest/");
 }
 
-function isSystemAllowedApi(pathname) {
-  // Internal system calls authenticated via x-ingest-secret
-  return pathname === "/api/search" || pathname.startsWith("/api/resolve") || pathname.startsWith("/api/audit/run/materialize") || (pathname.startsWith("/api/documents/") && pathname.endsWith("/materialize"));}
+function isDualAuthApi(pathname: string) {
+  // Allow either:
+  //  - system secret (x-ingest-secret) for internal automation
+  //  - user cookie auth for normal logged-in users
+  if (pathname === "/api/search") return true;
 
-function isProtectedApi(pathname) {
+  if (pathname.startsWith("/api/resolve/")) return true;
+
+  // materialize-and-run internal call + materialize endpoint
+  if (pathname.startsWith("/api/audit/run/materialize")) return true;
+  if (pathname.startsWith("/api/documents/") && pathname.endsWith("/materialize")) return true;
+
+  return false;
+}
+
+function isProtectedApi(pathname: string) {
   // Everything under /api except explicit exclusions
   return (
     pathname.startsWith("/api/") &&
     !isPublicApi(pathname) &&
     !isIngestPath(pathname) &&
-    !isSystemAllowedApi(pathname)
+    !isDualAuthApi(pathname)
   );
 }
 
-function isProtectedApp(pathname) {
+function isProtectedApp(pathname: string) {
   return (
     pathname === "/app" ||
     pathname.startsWith("/app/") ||
@@ -47,62 +59,60 @@ function isProtectedApp(pathname) {
   );
 }
 
+function checkSystemSecret(req: Request) {
+  const provided = req.headers.get("x-ingest-secret") || "";
+  const expected = process.env.INGEST_SECRET || "";
+  if (!expected) return false;
+  return provided === expected;
+}
+
 /* ------------------------------- middleware ------------------------------ */
 
-export async function middleware(req) {
+export async function middleware(req: any) {
   const { pathname } = req.nextUrl;
 
-  // Always allow public paths
+  // Always allow public paths and public APIs
   if (isPublicPath(pathname)) return NextResponse.next();
-
-  // Public APIs
   if (isPublicApi(pathname)) return NextResponse.next();
 
   // Always allow preflight
   if (req.method === "OPTIONS") return NextResponse.next();
 
-  // Ingest routes: header-based auth only
+  // Ingest routes: system secret ONLY
   if (isIngestPath(pathname)) {
-    const provided = req.headers.get("x-ingest-secret") || "";
-    const expected = process.env.INGEST_SECRET || "";
-
-    if (!expected || provided !== expected) {
+    if (!checkSystemSecret(req)) {
       return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
     }
     return NextResponse.next();
   }
 
-  // System-allowed APIs: also header-based auth
-  if (isSystemAllowedApi(pathname)) {
-    const provided = req.headers.get("x-ingest-secret") || "";
-    const expected = process.env.INGEST_SECRET || "";
-
-    if (!expected || provided !== expected) {
-      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
-    }
-    return NextResponse.next();
+  // Dual-auth APIs: system secret OR user cookie
+  if (isDualAuthApi(pathname)) {
+    if (checkSystemSecret(req)) return NextResponse.next();
+    // else fall through to user auth below
   }
 
   // If not protected, allow
-  if (!isProtectedApi(pathname) && !isProtectedApp(pathname)) {
+  if (!isProtectedApi(pathname) && !isProtectedApp(pathname) && !isDualAuthApi(pathname)) {
     return NextResponse.next();
   }
 
   // Supabase session auth
   const res = NextResponse.next();
+
   const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
       cookies: {
-        get(name) {
+        get(name: string) {
           return req.cookies.get(name)?.value;
         },
-        set(name, value, options) {
+        set(name: string, value: string, options: any) {
           res.cookies.set({ name, value, ...options });
         },
-        remove(name, options) {
-          res.cookies.set({ name, value: "", ...options });
+        remove(name: string, options: any) {
+          res.cookies.set({ name, value: "", ...options, maxAge: 0 });
         },
       },
     }
@@ -127,4 +137,3 @@ export async function middleware(req) {
 export const config = {
   matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
-
