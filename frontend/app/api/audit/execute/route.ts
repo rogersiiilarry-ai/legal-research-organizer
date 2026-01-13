@@ -5,6 +5,7 @@ import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 /* ------------------------------- helpers ------------------------------- */
 
@@ -90,10 +91,12 @@ async function requireSystemOrUser(req: Request): Promise<Auth> {
   const provided = req.headers.get("x-ingest-secret") || "";
   const expected = process.env.INGEST_SECRET || "";
 
+  // Allow "system" calls for automated pipelines (ingest secret)
   if (expected && provided && provided === expected) {
     return { ok: true, mode: "system", userId: null };
   }
 
+  // Otherwise require a logged-in user via Supabase auth cookie
   const cookieStore = cookies();
   const supabaseAuth = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
@@ -127,7 +130,11 @@ function isAdminAllowlist(userId: string | null) {
   return list.includes(userId);
 }
 
-type DbEntitlement = { isAdmin: boolean; freeAccess: boolean; freeTier: "basic" | "pro" | null };
+type DbEntitlement = {
+  isAdmin: boolean;
+  freeAccess: boolean;
+  freeTier: "basic" | "pro" | null;
+};
 
 async function tryGetDbEntitlement(supabase: any, userId: string): Promise<DbEntitlement> {
   try {
@@ -158,6 +165,7 @@ function resolveAccess(input: {
 }) {
   const { authMode, userId, analysisMeta, dbEntitlement } = input;
 
+  // System pipeline calls (ingest secret) always allowed; tier comes from analysis meta
   if (authMode === "system") {
     const tier = normalizeTier(analysisMeta?.tier);
     return { allowed: true as const, tier, isAdmin: true as const, exportAllowed: tier === "pro" };
@@ -165,7 +173,12 @@ function resolveAccess(input: {
 
   const isAdmin = isAdminAllowlist(userId) || !!dbEntitlement?.isAdmin;
   if (isAdmin) {
-    return { allowed: true as const, tier: "pro" as const, isAdmin: true as const, exportAllowed: true as const };
+    return {
+      allowed: true as const,
+      tier: "pro" as const,
+      isAdmin: true as const,
+      exportAllowed: true as const,
+    };
   }
 
   if (dbEntitlement?.freeAccess) {
@@ -327,7 +340,8 @@ function extractMoneyFindings(chunks: ChunkRow[]) {
 }
 
 function extractExhibitFindings(chunks: ChunkRow[]) {
-  const exhibitRe = /\b(exhibit\s+[A-Z0-9]+|attachment\s+\d+|see\s+attached|appendix\s+[A-Z0-9]+|photo(?:graph)?s?|video|bodycam|dashcam)\b/i;
+  const exhibitRe =
+    /\b(exhibit\s+[A-Z0-9]+|attachment\s+\d+|see\s+attached|appendix\s+[A-Z0-9]+|photo(?:graph)?s?|video|bodycam|dashcam)\b/i;
   const hits = findSentenceEvidence(chunks, exhibitRe, 18);
 
   if (!hits.length) {
@@ -369,9 +383,12 @@ function extractExhibitFindings(chunks: ChunkRow[]) {
 }
 
 function extractPartiesAndCaseSignals(chunks: ChunkRow[]) {
-  const caseNoRe = /\b(case\s*(no\.?|number)|docket\s*(no\.?|number))\s*[:#]?\s*([A-Z0-9\-\/\.]{4,})\b/i;
-  const courtRe = /\b(circuit\s+court|district\s+court|court\s+of\s+appeals|supreme\s+court|municipal\s+court)\b/i;
-  const judgeRe = /\b(judge|magistrate|hon\.)\s+([A-Z][A-Za-z'’-]+(?:\s+[A-Z][A-Za-z'’-]+){0,2})\b/i;
+  const caseNoRe =
+    /\b(case\s*(no\.?|number)|docket\s*(no\.?|number))\s*[:#]?\s*([A-Z0-9\-\/\.]{4,})\b/i;
+  const courtRe =
+    /\b(circuit\s+court|district\s+court|court\s+of\s+appeals|supreme\s+court|municipal\s+court)\b/i;
+  const judgeRe =
+    /\b(judge|magistrate|hon\.)\s+([A-Z][A-Za-z'’-]+(?:\s+[A-Z][A-Za-z'’-]+){0,2})\b/i;
   const partyRe = /\b(plaintiff|defendant|petitioner|respondent)\b/i;
 
   const caseHits = findSentenceEvidence(chunks, caseNoRe, 8);
@@ -380,11 +397,14 @@ function extractPartiesAndCaseSignals(chunks: ChunkRow[]) {
   const partyHits = findSentenceEvidence(chunks, partyRe, 10);
 
   const evidence: any[] = [];
-
-  for (const h of caseHits) evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
-  for (const h of courtHits) evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
-  for (const h of judgeHits) evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
-  for (const h of partyHits) evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
+  for (const h of caseHits)
+    evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
+  for (const h of courtHits)
+    evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
+  for (const h of judgeHits)
+    evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
+  for (const h of partyHits)
+    evidence.push({ type: "sentence", chunk_index: h.chunk_index, snippet: clip(h.sentence, 340), match: h.match });
 
   if (!evidence.length) {
     return [
@@ -487,7 +507,9 @@ export async function POST(req: Request) {
     if (aErr) return json(500, { ok: false, error: aErr.message });
     if (!analysis) return json(404, { ok: false, error: "Analysis not found" });
 
-    if (auth.mode === "user" && (analysis as any).owner_id && (analysis as any).owner_id !== auth.userId) {
+    // Ownership guard (supports either owner_id or user_id depending on schema evolution)
+    const ownerId = (analysis as any).owner_id || (analysis as any).user_id || null;
+    if (auth.mode === "user" && ownerId && ownerId !== auth.userId) {
       return json(403, { ok: false, error: "Forbidden" });
     }
 
@@ -500,8 +522,16 @@ export async function POST(req: Request) {
       dbEntitlement,
     });
 
+    // IMPORTANT: Don't hard-fail. Tell the client to start Stripe Checkout.
     if (!access.allowed) {
-      return json(402, { ok: false, error: "Payment required", code: "PAYMENT_REQUIRED" });
+      const meta = (((analysis as any).meta) || {}) as any;
+      return json(200, {
+        ok: true,
+        requires_payment: true,
+        code: "PAYMENT_REQUIRED",
+        analysisId,
+        requestedTier: normalizeTier(meta?.tier),
+      });
     }
 
     const docId = (analysis as any).target_document_id;
@@ -524,6 +554,7 @@ export async function POST(req: Request) {
 
     const { coverage, gaps, joined, chunkCount, statementCount } = buildCoverageFindings(chunks, access.tier);
 
+    // If there is no extractable text, persist a "done" analysis with warnings.
     if (!joined) {
       const newMeta = {
         ...(((analysis as any).meta) || {}),
