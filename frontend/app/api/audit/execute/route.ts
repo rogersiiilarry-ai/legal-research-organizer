@@ -45,6 +45,10 @@ function normalizeTier(v: any): "basic" | "pro" {
   return t === "pro" ? "pro" : "basic";
 }
 
+function isUuid(v: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v || "");
+}
+
 /* -------------------------------- auth -------------------------------- */
 
 type AuthOk =
@@ -62,11 +66,15 @@ async function requireSystemOrUser(req: Request): Promise<Auth> {
   const provided = req.headers.get("x-ingest-secret") || "";
   const expected = process.env.INGEST_SECRET || "";
 
+  // system automation bypass
   if (expected && provided && provided === expected) {
     return { ok: true, mode: "system", userId: null };
   }
 
+  // user cookie auth
   const cookieStore = cookies();
+
+  // IMPORTANT: set/remove must be implemented for Supabase refresh to work
   const supabaseAuth = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
     mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
@@ -75,8 +83,12 @@ async function requireSystemOrUser(req: Request): Promise<Auth> {
         get(name: string) {
           return cookieStore.get(name)?.value;
         },
-        set() {},
-        remove() {},
+        set(name: string, value: string, options: any) {
+          cookieStore.set({ name, value, ...options });
+        },
+        remove(name: string, options: any) {
+          cookieStore.set({ name, value: "", ...options, maxAge: 0 });
+        },
       },
     }
   );
@@ -145,7 +157,6 @@ function resolveAccess(input: {
     return { allowed: true as const, tier, isAdmin: false as const, exportAllowed: tier === "pro" };
   }
 
-  // paid flag (set by webhook or manual)
   const paid = toBool(analysisMeta?.paid);
   if (!paid) return { allowed: false as const, reason: "PAYMENT_REQUIRED" as const };
 
@@ -153,7 +164,7 @@ function resolveAccess(input: {
   return { allowed: true as const, tier, isAdmin: false as const, exportAllowed: tier === "pro" };
 }
 
-/* ---------------------------- audit logic (simple) ---------------------------- */
+/* ---------------------------- audit logic (deterministic) ---------------------------- */
 
 type ChunkRow = { chunk_index: number; content: string };
 
@@ -213,13 +224,11 @@ function buildFindings(chunks: ChunkRow[], tier: "basic" | "pro") {
     },
   ];
 
-  // very lightweight signals (keep deterministic)
   const moneyRe = /\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?/g;
   const dateRe =
     /\b(?:(?:0?[1-9]|1[0-2])[\/\-](?:0?[1-9]|[12]\d|3[01])[\/\-](?:\d{2}|\d{4})|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\.\s]+(?:0?[1-9]|[12]\d|3[01]),?\s+(?:\d{4}))\b/i;
 
   const sampleSentences = splitSentences(joined).slice(0, 200);
-
   const moneyHits = sampleSentences.filter((s) => moneyRe.test(s));
   const dateHits = sampleSentences.filter((s) => dateRe.test(s));
 
@@ -254,8 +263,10 @@ export async function POST(req: Request) {
     if (isAuthErr(auth)) return json(auth.status, { ok: false, error: auth.error });
 
     const body = await readJson(req);
-    const analysisId = safeStr(body?.analysisId || body?.analysis_id || "", 80);
+
+    const analysisId = safeStr(body?.analysisId ?? body?.analysis_id ?? "", 80);
     if (!analysisId) return json(400, { ok: false, error: "analysisId is required" });
+    if (!isUuid(analysisId)) return json(400, { ok: false, error: "analysisId must be a UUID" });
 
     const supabase = createClient(
       mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
@@ -265,15 +276,15 @@ export async function POST(req: Request) {
 
     const { data: analysis, error: aErr } = await supabase
       .from("analyses")
-      .select("*")
+      .select("id, owner_id, target_document_id, status, summary, meta")
       .eq("id", analysisId)
       .maybeSingle();
 
     if (aErr) return json(500, { ok: false, error: aErr.message });
     if (!analysis) return json(404, { ok: false, error: "Analysis not found" });
 
-    // owner check
-    if (auth.mode === "user" && (analysis as any).owner_id && (analysis as any).owner_id !== auth.userId) {
+    // owner check (user mode)
+    if (auth.mode === "user" && analysis.owner_id && analysis.owner_id !== auth.userId) {
       return json(403, { ok: false, error: "Forbidden" });
     }
 
@@ -282,10 +293,13 @@ export async function POST(req: Request) {
     const access = resolveAccess({
       authMode: auth.mode,
       userId: auth.mode === "user" ? auth.userId : null,
-      analysisMeta: (analysis as any).meta || {},
+      analysisMeta: analysis.meta || {},
       dbEntitlement,
     });
 
+    // IMPORTANT:
+    // Returning 200 with requires_payment keeps your current UI behavior.
+    // If you prefer HTTP 402, change this here.
     if (!access.allowed) {
       return json(200, {
         ok: true,
@@ -295,7 +309,7 @@ export async function POST(req: Request) {
       });
     }
 
-    const docId = (analysis as any).target_document_id;
+    const docId = safeStr(analysis.target_document_id, 80);
     if (!docId) return json(400, { ok: false, error: "analysis.target_document_id is missing" });
 
     const { data: chunkRows, error: cErr } = await supabase
@@ -315,57 +329,33 @@ export async function POST(req: Request) {
 
     const { joined, findings, chunkCount, statementCount } = buildFindings(chunks, access.tier);
 
-    if (!joined) {
-      const newMeta = {
-        ...(((analysis as any).meta) || {}),
-        findings,
-        executed_at: new Date().toISOString(),
-        executed_tier: access.tier,
-        exportAllowed: access.exportAllowed,
-        stats: { chunkCount: 0, statementEstimate: 0 },
-      };
-
-      await supabase
-        .from("analyses")
-        .update({
-          status: "done",
-          summary: "No text available to audit (no chunks found). Materialize the document first.",
-          meta: newMeta,
-          error: null,
-        })
-        .eq("id", analysisId);
-
-      return json(200, {
-        ok: true,
-        analysisId,
-        status: "done",
-        tier: access.tier,
-        exportAllowed: access.exportAllowed,
-        summary: "No text available to audit (no chunks found). Materialize the document first.",
-        findings: newMeta.findings,
-      });
-    }
-
-    const summary =
-      `Audit executed (${access.tier.toUpperCase()}). ` +
-      `Coverage: ${chunkCount} chunks parsed (~${statementCount} statements). ` +
-      `Findings generated: ${findings.length}.`;
-
-    const newMeta = {
-      ...(((analysis as any).meta) || {}),
+    const executedMeta = {
+      ...(analysis.meta || {}),
       findings,
       executed_at: new Date().toISOString(),
       executed_tier: access.tier,
       exportAllowed: access.exportAllowed,
-      stats: { chunkCount, statementEstimate: statementCount },
+      stats: { chunkCount, statementEstimate: joined ? statementCount : 0 },
     };
+
+    let status = "done";
+    let summary: string;
+
+    if (!joined) {
+      summary = "No text available to audit (no chunks found). Materialize the document first.";
+    } else {
+      summary =
+        `Audit executed (${access.tier.toUpperCase()}). ` +
+        `Coverage: ${chunkCount} chunks parsed (~${statementCount} statements). ` +
+        `Findings generated: ${findings.length}.`;
+    }
 
     const { error: uErr } = await supabase
       .from("analyses")
       .update({
-        status: "done",
+        status,
         summary,
-        meta: newMeta,
+        meta: executedMeta,
         error: null,
       })
       .eq("id", analysisId);
@@ -375,7 +365,7 @@ export async function POST(req: Request) {
     return json(200, {
       ok: true,
       analysisId,
-      status: "done",
+      status,
       tier: access.tier,
       exportAllowed: access.exportAllowed,
       summary,
