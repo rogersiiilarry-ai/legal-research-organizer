@@ -15,8 +15,7 @@ function json(status: number, payload: any) {
     status,
     headers: {
       "Cache-Control": "no-store",
-      // fingerprint so we can prove prod is hitting THIS handler
-      "x-checkout-handler": "stripe-checkout-route-ts-2026-01-13-A",
+      "x-checkout-handler": "stripe-checkout-route-ts-2026-01-14-B",
     },
   });
 }
@@ -36,7 +35,33 @@ function normalizeTier(v: any): "basic" | "pro" {
   return s === "pro" ? "pro" : "basic";
 }
 
-async function requireUser() {
+function readBearerToken(req: Request) {
+  const h = req.headers.get("authorization") || req.headers.get("Authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m?.[1]?.trim() || "";
+}
+
+/* ------------------------------- auth ------------------------------- */
+/**
+ * Prefer Bearer token (works even when cookies are missing on Vercel),
+ * fall back to cookies for normal browser flows.
+ */
+async function requireUser(req: Request) {
+  const bearer = readBearerToken(req);
+
+  // 1) Bearer token auth
+  if (bearer) {
+    const supabaseJwt = createClient(
+      mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+      mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
+      { auth: { persistSession: false } }
+    );
+
+    const { data, error } = await supabaseJwt.auth.getUser(bearer);
+    if (!error && data?.user) return { user: data.user, mode: "bearer" as const };
+  }
+
+  // 2) Cookie auth fallback
   const cookieStore = cookies();
 
   const supabase = createServerClient(
@@ -47,6 +72,7 @@ async function requireUser() {
         get(name: string) {
           return cookieStore.get(name)?.value;
         },
+        // cookies are not required to be mutated for getUser()
         set() {},
         remove() {},
       },
@@ -55,29 +81,35 @@ async function requireUser() {
 
   const { data, error } = await supabase.auth.getUser();
   if (error || !data?.user) return null;
-  return data.user;
+
+  return { user: data.user, mode: "cookie" as const };
 }
 
 /* --------------------------------- route -------------------------------- */
 
 export async function POST(req: Request) {
   try {
-    const user = await requireUser();
-    if (!user) return json(401, { ok: false, error: "Unauthorized" });
+    const authed = await requireUser(req);
+    if (!authed) {
+      return json(401, {
+        ok: false,
+        error: "Unauthorized",
+        hint: "Send Authorization: Bearer <supabase_access_token> or ensure Supabase auth cookies are present.",
+      });
+    }
 
     const body = await req.json().catch(() => ({}));
 
     const analysisId = safeStr(body?.analysis_id || body?.analysisId);
     const tier = normalizeTier(body?.tier);
 
-    if (!analysisId) return json(400, { ok: false, error: "analysis_id required" });
+    if (!analysisId) return json(400, { ok: false, error: "analysisId (or analysis_id) required" });
 
     const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"));
 
     const priceId = tier === "pro" ? mustEnv("STRIPE_PRICE_PRO") : mustEnv("STRIPE_PRICE_BASIC");
 
-    // sanity check so you never see “subscription mode requires recurring price”
-    // unless you're NOT hitting this handler or your env points to wrong price.
+    // Guard: this endpoint is one-time checkout only.
     const price = await stripe.prices.retrieve(priceId);
     if (price.recurring) {
       return json(500, {
@@ -87,13 +119,14 @@ export async function POST(req: Request) {
       });
     }
 
+    // Admin (service role) for DB update
     const admin = createClient(
       mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
       mustEnv("SUPABASE_SERVICE_ROLE_KEY"),
       { auth: { persistSession: false } }
     );
 
-    // Persist requested tier on the analysis (unpaid)
+    // Read existing meta
     const { data: analysis, error: readErr } = await admin
       .from("analyses")
       .select("meta")
@@ -104,6 +137,7 @@ export async function POST(req: Request) {
 
     const meta = (analysis?.meta || {}) as any;
 
+    // Persist requested tier on the analysis (unpaid until webhook flips it)
     const { error: updErr } = await admin
       .from("analyses")
       .update({ meta: { ...meta, tier, paid: false } })
@@ -116,16 +150,14 @@ export async function POST(req: Request) {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items: [{ price: priceId, quantity: 1 }],
-
-      // match the UI route you actually have (/audit)
       success_url: `${siteUrl}/audit?analysisId=${encodeURIComponent(analysisId)}&paid=1`,
       cancel_url: `${siteUrl}/audit?analysisId=${encodeURIComponent(analysisId)}&canceled=1`,
-
       client_reference_id: analysisId,
       metadata: {
         analysis_id: analysisId,
-        user_id: user.id,
+        user_id: authed.user.id,
         tier,
+        auth_mode: authed.mode,
       },
     });
 
