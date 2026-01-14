@@ -1,5 +1,9 @@
-// frontend/app/api/audit/run/route.ts
+﻿// frontend/app/api/audit/run/route.ts
 import { NextResponse } from "next/server";
+import Stripe from "stripe";
+import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
+import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,6 +17,16 @@ function json(status: number, payload: any, extraHeaders?: HeadersInit) {
   });
 }
 
+function mustEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing ${name}`);
+  return v;
+}
+
+function safeStr(v: any) {
+  return typeof v === "string" ? v.trim() : "";
+}
+
 async function readJson(req: Request): Promise<any> {
   const raw = await req.text().catch(() => "");
   if (!raw) return {};
@@ -23,11 +37,10 @@ async function readJson(req: Request): Promise<any> {
   }
 }
 
-function safeStr(v: any) {
-  return typeof v === "string" ? v.trim() : "";
-}
-
 function getOrigin(req: Request) {
+  const env = process.env.NEXT_PUBLIC_SITE_URL;
+  if (env && env.trim()) return env.trim().replace(/\/$/, "");
+
   const proto = safeStr(req.headers.get("x-forwarded-proto")) || "https";
   const host = safeStr(req.headers.get("x-forwarded-host")) || safeStr(req.headers.get("host"));
   if (host) return `${proto}://${host}`;
@@ -39,161 +52,277 @@ function getOrigin(req: Request) {
   }
 }
 
-function buildInternalUrl(req: Request, path: string) {
-  return `${getOrigin(req)}${path}`;
+function wantsHtml(req: Request) {
+  const accept = req.headers.get("accept") || "";
+  return accept.includes("text/html");
 }
 
-function getAllSetCookies(res: Response): string[] {
-  // Node/undici supports getSetCookie() in some runtimes; Next may polyfill.
-  const anyHeaders: any = res.headers as any;
+function normalizeTier(v: any): "basic" | "pro" {
+  const s = safeStr(v).toLowerCase();
+  return s === "pro" ? "pro" : "basic";
+}
 
-  if (typeof anyHeaders.getSetCookie === "function") {
-    const arr = anyHeaders.getSetCookie();
-    if (Array.isArray(arr) && arr.length) return arr;
+function isUuid(v: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v || "");
+}
+
+/* ------------------------------ auth (user) ------------------------------ */
+
+async function requireUser(req: Request): Promise<{ id: string } | null> {
+  // Cookie auth only (this is a user-initiated UI action)
+  const cookieStore = cookies();
+
+  const supabase = createServerClient(
+    mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+    mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
+    {
+      cookies: {
+        get(name: string) {
+          return cookieStore.get(name)?.value;
+        },
+        set() {},
+        remove() {},
+      },
+    }
+  );
+
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data?.user?.id) return null;
+  return { id: data.user.id };
+}
+
+/* ------------------------------ DB helpers ------------------------------ */
+
+async function loadDocument(admin: any, token: string) {
+  const t = safeStr(token);
+  if (!t) return { doc: null as any, error: "document_id is required" };
+
+  const sel = "id, owner_id, title, external_id, raw";
+
+  // If UUID: try id
+  if (isUuid(t)) {
+    const r = await admin.from("documents").select(sel).eq("id", t).maybeSingle();
+    if (r.error) return { doc: null as any, error: r.error.message };
+    if (r.data) return { doc: r.data, error: null as any };
   }
 
-  // Fallback: single header (may be comma-joined; imperfect but better than nothing)
-  const sc = res.headers.get("set-cookie");
-  return sc ? [sc] : [];
+  // Else: try external_id
+  const r2 = await admin.from("documents").select(sel).eq("external_id", t).maybeSingle();
+  if (r2.error) return { doc: null as any, error: r2.error.message };
+  if (r2.data) return { doc: r2.data, error: null as any };
+
+  return { doc: null as any, error: null as any };
 }
 
-function applySetCookie(out: NextResponse, setCookies: string[]) {
-  for (const v of setCookies) out.headers.append("set-cookie", v);
-  return out;
+/**
+ * IMPORTANT:
+ * This is your current placeholder entitlement check.
+ * Replace later with real subscription/entitlement logic.
+ */
+async function isEntitled(_admin: any, _userId: string, _tier: "basic" | "pro"): Promise<boolean> {
+  return false;
 }
 
-/* ----------------------------- forward plumbing ---------------------------- */
+/* ------------------------------ Stripe helpers ------------------------------ */
 
-type ForwardResult =
-  | { kind: "redirect"; status: number; location: string; setCookies: string[] }
-  | { kind: "json"; status: number; payload: any; setCookies: string[] };
+function pickPriceId(tier: "basic" | "pro") {
+  return tier === "pro" ? mustEnv("STRIPE_PRICE_PRO") : mustEnv("STRIPE_PRICE_BASIC");
+}
 
-async function forward(req: Request, url: string, body: any): Promise<ForwardResult> {
-  const ingestSecret = safeStr(req.headers.get("x-ingest-secret"));
-  const cookie = req.headers.get("cookie") || "";
+async function createCheckoutSession(opts: {
+  origin: string;
+  tier: "basic" | "pro";
+  userId: string;
+  analysisId: string;
+  documentId: string;
+}) {
+  const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"));
 
-  // IMPORTANT:
-  // - For XHR/fetch, prefer JSON accept. Stripe redirects are handled by GET /audit/run (browser nav).
-  // - If you want redirects on POST too, set Accept to include text/html.
-  const accept = req.method === "GET"
-    ? (req.headers.get("accept") || "text/html,application/json;q=0.9,*/*;q=0.8")
-    : "application/json";
+  const priceId = pickPriceId(opts.tier);
 
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    accept,
-  };
+  // mode=payment means STRIPE_PRICE_* MUST be a one-time price
+  const price = await stripe.prices.retrieve(priceId);
+  if (price.recurring) {
+    throw new Error(
+      `STRIPE_PRICE_${opts.tier.toUpperCase()} is recurring. For mode=payment you must use a one-time Price ID.`
+    );
+  }
 
-  if (cookie) headers["cookie"] = cookie;
-  if (ingestSecret) headers["x-ingest-secret"] = ingestSecret;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body ?? {}),
-    cache: "no-store",
-    redirect: "manual",
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: [{ price: priceId, quantity: 1 }],
+    success_url: `${opts.origin}/audit?analysisId=${encodeURIComponent(opts.analysisId)}&paid=1`,
+    cancel_url: `${opts.origin}/audit?analysisId=${encodeURIComponent(opts.analysisId)}&canceled=1`,
+    client_reference_id: opts.analysisId,
+    metadata: {
+      analysis_id: opts.analysisId,
+      user_id: opts.userId,
+      document_id: opts.documentId,
+      tier: opts.tier,
+      product: "materialize",
+    },
   });
 
-  const setCookies = getAllSetCookies(res);
-
-  // Redirect case (Stripe checkout redirect, etc.)
-  if (res.status >= 300 && res.status < 400) {
-    const location = res.headers.get("location") || "";
-    if (location) return { kind: "redirect", status: res.status, location, setCookies };
-  }
-
-  const text = await res.text().catch(() => "");
-  let payload: any = {};
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch {
-    payload = {
-      ok: false,
-      error: "Downstream returned non-JSON response",
-      raw: text.slice(0, 1000),
-    };
-  }
-
-  return { kind: "json", status: res.status, payload, setCookies };
+  return session.url || null;
 }
 
-/* --------------------------------- handler -------------------------------- */
+/* ------------------------------ Materialize call ------------------------------ */
 
-async function handle(req: Request, body: any) {
+async function callMaterialize(origin: string, documentId: string, timeoutMs: number) {
+  const ingest = safeStr(process.env.INGEST_SECRET);
+  if (!ingest) throw new Error("Missing INGEST_SECRET");
+
+  const u = new URL(`/api/documents/${documentId}/materialize`, origin);
+  u.searchParams.set("timeoutMs", String(timeoutMs || 45000));
+
+  const res = await fetch(u.toString(), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-ingest-secret": ingest,
+    },
+    body: JSON.stringify({}),
+    cache: "no-store",
+  });
+
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || j?.ok === false) throw new Error(j?.error || `Materialize failed (${res.status})`);
+  return j;
+}
+
+/* --------------------------------- handler --------------------------------- */
+
+async function handle(req: Request) {
+  const user = await requireUser(req);
+  if (!user) return json(401, { ok: false, phase: "auth", error: "Unauthorized" });
+
+  const body = await readJson(req);
   const u = new URL(req.url);
 
-  const mode = safeStr(body?.mode) || safeStr(u.searchParams.get("mode")) || "materialize-and-run";
-  const kind = safeStr(body?.kind) || safeStr(u.searchParams.get("kind")) || "case_fact_audit";
+  // Allow tier selection from UI at materialize time
+  const tier = normalizeTier(body?.tier ?? u.searchParams.get("tier") ?? "basic");
 
-  const document_id =
-    safeStr(body?.document_id) ||
-    safeStr(body?.documentId) ||
-    safeStr(u.searchParams.get("document_id")) ||
-    safeStr(u.searchParams.get("documentId"));
+  const documentToken = safeStr(body?.document_id ?? body?.documentId ?? u.searchParams.get("document_id") ?? u.searchParams.get("documentId"));
+  if (!documentToken) return json(400, { ok: false, phase: "input", error: "document_id is required" });
 
-  if (mode !== "execute-only" && !document_id) {
-    return json(400, { ok: false, phase: "input", error: "document_id is required" });
+  const timeoutMs = Number(body?.timeoutMs ?? body?.materialize?.timeoutMs ?? 45000) || 45000;
+
+  const admin = createClient(
+    mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
+    mustEnv("SUPABASE_SERVICE_ROLE_KEY"),
+    { auth: { persistSession: false } }
+  );
+
+  const { doc, error: loadErr } = await loadDocument(admin, documentToken);
+  if (loadErr) return json(500, { ok: false, phase: "load_document", error: loadErr });
+  if (!doc) return json(404, { ok: false, phase: "load_document", error: "Document not found", identifier: documentToken });
+
+  const documentId = String(doc.id);
+
+  // Ownership enforcement
+  if (doc.owner_id && String(doc.owner_id) !== user.id) {
+    return json(403, { ok: false, phase: "authz", error: "Forbidden" });
   }
 
-  // execute-only → forward to /api/audit/execute
-  if (mode === "execute-only") {
-    const analysisId = safeStr(body?.analysisId) || safeStr(u.searchParams.get("analysisId"));
-    if (!analysisId) return json(400, { ok: false, phase: "input", error: "analysisId is required" });
+  // Create an analysis row immediately (represents the attempted materialize purchase/execution)
+  const origin = getOrigin(req);
 
-    const url = buildInternalUrl(req, "/api/audit/execute");
-    const r = await forward(req, url, { analysisId });
-
-    if (r.kind === "redirect") {
-      const out = NextResponse.redirect(r.location, r.status as any);
-      return applySetCookie(out, r.setCookies);
-    }
-
-    const out = json(r.status, r.payload);
-    return applySetCookie(out, r.setCookies);
-  }
-
-  // default → forward to materialize-and-run
-  const url = buildInternalUrl(req, "/api/audit/run/materialize-and-run");
-
-  const forwardBody = {
-    ...body,
-    kind,
-    document_id,
-    documentId: undefined,
-  };
-
-  const r = await forward(req, url, forwardBody);
-
-  if (r.kind === "redirect") {
-    const out = NextResponse.redirect(r.location, r.status as any);
-    return applySetCookie(out, r.setCookies);
-  }
-
-  if (r.status >= 400) {
-    const out = json(r.status, {
-      ...r.payload,
-      debug: {
-        forwardedTo: url,
-        mode,
-        hasCookie: Boolean(req.headers.get("cookie")),
-        hasIngestSecret: Boolean(req.headers.get("x-ingest-secret")),
-        document_id: document_id || null,
+  const { data: created, error: createErr } = await admin
+    .from("analyses")
+    .insert({
+      scope: "document",
+      status: "pending_payment",
+      owner_id: user.id,
+      target_document_id: documentId,
+      title: `materialize (${new Date().toISOString()})`,
+      meta: {
+        kind: "materialize",
+        tier,
+        paid: false,
+        source: "audit/run",
+        document_identifier: documentToken,
       },
+    })
+    .select("id")
+    .single();
+
+  if (createErr) return json(500, { ok: false, phase: "create_analysis", error: createErr.message });
+
+  const analysisId = String(created.id);
+
+  // Entitlement check
+  const entitled = await isEntitled(admin, user.id, tier);
+
+  // If not entitled → send to checkout NOW
+  if (!entitled) {
+    const checkoutUrl = await createCheckoutSession({
+      origin,
+      tier,
+      userId: user.id,
+      analysisId,
+      documentId,
     });
-    return applySetCookie(out, r.setCookies);
+
+    if (!checkoutUrl) return json(500, { ok: false, phase: "stripe", error: "Failed to create checkout session" });
+
+    // Persist checkout URL for debugging / reconciliation
+    await admin.from("analyses").update({
+      meta: {
+        kind: "materialize",
+        tier,
+        paid: false,
+        source: "audit/run",
+        document_identifier: documentToken,
+        checkout_url: checkoutUrl,
+      },
+    }).eq("id", analysisId);
+
+    if (wantsHtml(req)) return NextResponse.redirect(checkoutUrl, 303);
+
+    return json(402, {
+      ok: false,
+      phase: "stripe",
+      error: "Payment required",
+      analysisId,
+      checkout_url: checkoutUrl,
+    });
   }
 
-  const out = json(r.status, r.payload);
-  return applySetCookie(out, r.setCookies);
+  // Entitled → materialize now
+  try {
+    await admin.from("analyses").update({ status: "running" }).eq("id", analysisId);
+
+    await callMaterialize(origin, documentId, timeoutMs);
+
+    await admin.from("analyses").update({
+      status: "completed",
+      summary: "Materialize completed.",
+      meta: {
+        kind: "materialize",
+        tier,
+        paid: true,
+        source: "audit/run",
+        document_identifier: documentToken,
+        completed_at: new Date().toISOString(),
+      },
+    }).eq("id", analysisId);
+
+    return json(200, { ok: true, phase: "completed", analysisId, document_id: documentId });
+  } catch (e: any) {
+    await admin.from("analyses").update({
+      status: "error",
+      error: e?.message || "Materialize failed",
+    }).eq("id", analysisId);
+
+    return json(500, { ok: false, phase: "materialize", error: e?.message || "Materialize failed", analysisId });
+  }
 }
 
 export async function POST(req: Request) {
-  const body = await readJson(req);
-  return handle(req, body);
+  return handle(req);
 }
 
-// Browser navigation support (Stripe redirect works reliably)
 export async function GET(req: Request) {
-  return handle(req, {}); // params come from querystring
+  // For browser navigation compatibility (optional)
+  return handle(req);
 }

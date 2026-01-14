@@ -21,10 +21,14 @@ function normalizeUiError(message: unknown) {
   if (!m) return "Something went wrong.";
 
   if (/<!doctype html/i.test(m) || /text\/html/i.test(m) || /returned html/i.test(m)) {
-    return `${m}\n\nHint: That URL returned HTML. Use a direct PDF download link or upload the PDF.`;
+    return `${m}\n\nHint: That endpoint returned HTML (likely a redirect). This usually means auth middleware redirected or the route isn't returning JSON. Check Network tab → Response and status code.`;
   }
 
   return m;
+}
+
+function isLikelyUuid(v: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
 }
 
 /* ------------------------------ types ------------------------------ */
@@ -83,7 +87,6 @@ type ExecuteResponse = {
   error?: string;
   message?: string;
 
-  // payment gate signals (your server may return 200 with these)
   requires_payment?: boolean;
   code?: string;
 
@@ -123,8 +126,6 @@ function pickDocTitle(d: DocumentRow) {
     "Untitled"
   );
 }
-
-/* ------------------------------ payload resolvers ------------------------------ */
 
 function resolveAnalysisRow(payload: AnalysisResponse | null): AnalysisRow | null {
   if (!payload || typeof payload !== "object") return null;
@@ -291,7 +292,21 @@ export default function AuditClient() {
     });
 
     const j = (await res.json().catch(() => ({}))) as any;
-    if (!res.ok) throw new Error(j?.error || j?.message || `Request failed (${res.status})`);
+
+    if (!res.ok) {
+      const msg =
+        j?.error ||
+        j?.message ||
+        `Request failed (${res.status})`;
+
+      // common auth UX improvement
+      if (res.status === 401) {
+        throw new Error(`${msg}\n\nYou appear to be logged out. Please log in again.`);
+      }
+
+      throw new Error(msg);
+    }
+
     return j as T;
   }
 
@@ -300,6 +315,7 @@ export default function AuditClient() {
   }
 
   async function startCheckout(analysisId: string, tier: "basic" | "pro") {
+    // This MUST return a Stripe-hosted URL
     const cj = await fetchJson<CheckoutResponse>("/api/stripe/checkout", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -307,9 +323,10 @@ export default function AuditClient() {
     });
 
     const url = safeStr(cj?.url).trim();
-    if (!url) throw new Error(cj?.error || cj?.message || "Failed to start checkout");
+    if (!url) {
+      throw new Error(cj?.error || cj?.message || "Checkout did not return a URL. Verify STRIPE_* env vars and route execution.");
+    }
 
-    // redirect to Stripe
     window.location.assign(url);
   }
 
@@ -381,7 +398,12 @@ export default function AuditClient() {
   /* ------------------------------ derived view models ------------------------------ */
 
   const shownAnalysisId = useMemo(() => {
-    return String((analysisPayload as any)?.analysisId || analysisIdFromQuery || "").trim();
+    const fromPayload =
+      safeStr((analysisPayload as any)?.analysisId) ||
+      safeStr((analysisPayload as any)?.analysis_id) ||
+      safeStr(resolveAnalysisRow(analysisPayload)?.id);
+
+    return String(fromPayload || analysisIdFromQuery || "").trim();
   }, [analysisPayload, analysisIdFromQuery]);
 
   const analysisRow = useMemo(() => resolveAnalysisRow(analysisPayload), [analysisPayload]);
@@ -396,9 +418,9 @@ export default function AuditClient() {
   }, [docId, runningMaterialize, runningExecute]);
 
   const canExecute = useMemo(() => {
-    const id = safeStr((analysisPayload as any)?.analysisId || analysisIdFromQuery).trim();
-    return !!id && !runningMaterialize && !runningExecute;
-  }, [analysisPayload, analysisIdFromQuery, runningMaterialize, runningExecute]);
+    const id = safeStr(shownAnalysisId).trim();
+    return !!id && isLikelyUuid(id) && !runningMaterialize && !runningExecute;
+  }, [shownAnalysisId, runningMaterialize, runningExecute]);
 
   /* ------------------------------ actions ------------------------------ */
 
@@ -411,6 +433,7 @@ export default function AuditClient() {
 
     setRunningMaterialize(true);
     try {
+      // Materialize should NOT paywall. If it does, that’s a server bug.
       const j = await fetchJson<MaterializeResponse>("/api/research", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -423,12 +446,12 @@ export default function AuditClient() {
       });
 
       const newAnalysisId = String(j?.analysisId || (j as any)?.analysis_id || "").trim();
-      if (!newAnalysisId) throw new Error("No analysisId returned");
+      if (!newAnalysisId) throw new Error(j?.error || j?.message || "No analysisId returned");
 
       router.replace(`/audit?analysisId=${encodeURIComponent(newAnalysisId)}`);
       router.refresh();
 
-      setInfo("Materialized successfully. Next step: execute the audit to generate findings.");
+      setInfo("Materialized successfully. Next step: Execute audit to generate findings.");
     } catch (e2: any) {
       setUiErr(e2?.message || "Materialize failed");
     } finally {
@@ -441,8 +464,9 @@ export default function AuditClient() {
     setErr("");
     setInfo("");
 
-    const id = String((analysisPayload as any)?.analysisId || analysisIdFromQuery || "").trim();
+    const id = String(shownAnalysisId || "").trim();
     if (!id) return setUiErr("analysisId is required");
+    if (!isLikelyUuid(id)) return setUiErr("analysisId looks invalid (expected UUID). Refresh or re-materialize.");
 
     setRunningExecute(true);
     try {
@@ -462,14 +486,15 @@ export default function AuditClient() {
         String(exec?.code || "").toUpperCase() === "PAYMENT_REQUIRED";
 
       if (requiresPayment) {
-        // Do not instruct manual DB edits; initiate checkout flow.
         setErr("");
         setInfo("Payment required. Redirecting to Stripe Checkout…");
         await startCheckout(id, tierChoice);
         return;
       }
 
-      if (!res.ok) throw new Error((exec as any)?.error || (exec as any)?.message || `Execute failed (${res.status})`);
+      if (!res.ok) {
+        throw new Error(exec?.error || exec?.message || `Execute failed (${res.status})`);
+      }
 
       const refreshed = await fetchAnalysis(id);
       const patched = patchRefreshedWithExecuteFindings(refreshed, exec);
@@ -492,7 +517,7 @@ export default function AuditClient() {
     setErr("");
     setInfo("");
 
-    const id = String((analysisPayload as any)?.analysisId || analysisIdFromQuery || "").trim();
+    const id = String(shownAnalysisId || "").trim();
     if (!id) return;
 
     try {
@@ -508,7 +533,10 @@ export default function AuditClient() {
     setErr("");
     setInfo("");
 
-    if (!exportAllowed) return;
+    if (!exportAllowed) {
+      setUiErr("PDF export is disabled. Choose Pro and complete checkout to enable export.");
+      return;
+    }
 
     const id = String(shownAnalysisId || "").trim();
     if (!id) return setUiErr("No analysis available to export.");
@@ -669,7 +697,9 @@ export default function AuditClient() {
           {/* Summary */}
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13, color: "rgba(248,250,252,.78)" }}>Summary</div>
-            <div style={{ marginTop: 4, color: "#f8fafc", whiteSpace: "pre-wrap" }}>{formatSummary(analysisRow)}</div>
+            <div style={{ marginTop: 4, color: "#f8fafc", whiteSpace: "pre-wrap" }}>
+              {formatSummary(analysisRow)}
+            </div>
           </div>
 
           <hr style={{ border: 0, borderTop: "1px solid rgba(255,255,255,.12)", margin: "16px 0" }} />
@@ -723,7 +753,9 @@ export default function AuditClient() {
                       <div style={{ fontSize: 12, color: "rgba(248,250,252,.75)" }}>{severity}</div>
                     </div>
 
-                    <div style={{ marginTop: 6, color: "rgba(248,250,252,.90)", whiteSpace: "pre-wrap" }}>{claim}</div>
+                    <div style={{ marginTop: 6, color: "rgba(248,250,252,.90)", whiteSpace: "pre-wrap" }}>
+                      {claim}
+                    </div>
 
                     {evidence != null ? (
                       <details style={{ marginTop: 8 }}>
