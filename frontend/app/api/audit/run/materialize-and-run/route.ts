@@ -177,7 +177,7 @@ async function createCheckout(origin: string, withPdf: boolean, userId: string, 
   const cancel_url = `${origin}/audit?checkout=cancel&doc=${encodeURIComponent(documentId)}`;
 
   const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
+    mode: "payment",
     line_items: [{ price, quantity: 1 }],
     success_url,
     cancel_url,
