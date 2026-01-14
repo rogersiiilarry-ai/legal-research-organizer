@@ -14,15 +14,12 @@ function isHttpUrl(v) {
 
 function normalizeUiError(message) {
   const m = safeStr(message);
-
   if (!m) return "Something went wrong.";
 
-  // common supabase storage errors
   if (/bucket not found/i.test(m)) {
     return "Storage bucket not found. Create a Storage bucket named 'documents' (or update the API to use your bucket name).";
   }
 
-  // pdf / html issues
   if (/returned html/i.test(m) || /not a pdf/i.test(m) || /<!doctype html/i.test(m)) {
     return "That link returned HTML (not a direct PDF). Download the PDF and upload it as a file instead.";
   }
@@ -51,10 +48,7 @@ export default function UploadPage() {
   const [title, setTitle] = useState("");
   const [jurisdiction, setJurisdiction] = useState("MI");
 
-  // file mode
   const [file, setFile] = useState(null);
-
-  // url mode
   const [pdfUrl, setPdfUrl] = useState("");
 
   const [err, setErr] = useState("");
@@ -71,8 +65,8 @@ export default function UploadPage() {
   async function uploadPdfToStorage(selectedFile) {
     const fd = new FormData();
     fd.append("file", selectedFile);
+    fd.append("folder", "uploads");
 
-    // This route returns { ok, bucket, path, url }
     const res = await fetch("/api/upload/pdf", {
       method: "POST",
       body: fd,
@@ -83,25 +77,32 @@ export default function UploadPage() {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(j?.error || j?.message || `Upload failed (${res.status})`);
 
-    if (!j?.url) {
-      // If you use private buckets + signed urls, this should be signedUrl.
+    // accept any common field name
+    const url = safeStr(j?.url) || safeStr(j?.signedUrl) || safeStr(j?.publicUrl) || safeStr(j?.uploadUrl);
+    if (!url || !isHttpUrl(url)) {
       throw new Error("Upload succeeded but no URL was returned by /api/upload/pdf.");
     }
 
-    return j; // { bucket, path, url }
+    return {
+      bucket: safeStr(j?.bucket),
+      path: safeStr(j?.path),
+      url,
+      signedUrl: safeStr(j?.signedUrl),
+      publicUrl: safeStr(j?.publicUrl),
+    };
   }
 
-  async function createDocumentFromPdfUrl(url) {
+  async function createDocumentFromPdfUrl(url, extraRaw) {
     const payload = {
       title: safeStr(title) || null,
       pdf_url: url,
       jurisdiction: safeStr(jurisdiction) || "MI",
       source: mode === "file" ? "storage_upload" : "pdf_url",
-      // store storage metadata in raw so you can trace provenance
-      raw:
-        mode === "file"
-          ? { uploaded: true, uploaded_via: "ui", uploaded_at: new Date().toISOString() }
-          : { uploaded: false, uploaded_via: "ui", uploaded_at: new Date().toISOString() },
+      raw: {
+        uploaded_via: "ui",
+        uploaded_at: new Date().toISOString(),
+        ...(extraRaw || {}),
+      },
     };
 
     const j = await fetchJson("/api/documents/create", {
@@ -112,7 +113,6 @@ export default function UploadPage() {
 
     const createdId = safeStr(j?.documentId || j?.id);
     if (!createdId) throw new Error("Create document succeeded but no documentId was returned.");
-
     return { documentId: createdId, response: j };
   }
 
@@ -126,25 +126,27 @@ export default function UploadPage() {
 
     setLoading(true);
     try {
-      let finalPdfUrl = "";
-
       if (mode === "file") {
-        setInfo("Uploading PDF to storage...");
+        setInfo("Uploading PDF...");
         const up = await uploadPdfToStorage(file);
-        finalPdfUrl = safeStr(up.url);
 
         setInfo("PDF uploaded. Creating document record...");
-        const created = await createDocumentFromPdfUrl(finalPdfUrl);
+        const created = await createDocumentFromPdfUrl(up.url, {
+          uploaded: true,
+          storage_bucket: up.bucket || "documents",
+          storage_path: up.path,
+          storage_signed_url: up.signedUrl || null,
+          storage_public_url: up.publicUrl || null,
+        });
 
         setDocId(created.documentId);
         setInfo("Done. Document created successfully.");
       } else {
-        // URL mode: create document directly from URL
-        finalPdfUrl = safeStr(pdfUrl);
+        const finalPdfUrl = safeStr(pdfUrl);
         if (!isHttpUrl(finalPdfUrl)) throw new Error("Please paste a valid http(s) PDF URL.");
 
         setInfo("Creating document record from URL...");
-        const created = await createDocumentFromPdfUrl(finalPdfUrl);
+        const created = await createDocumentFromPdfUrl(finalPdfUrl, { uploaded: false });
 
         setDocId(created.documentId);
         setInfo("Done. Document created successfully.");
@@ -166,24 +168,12 @@ export default function UploadPage() {
       <div className="card" style={{ marginTop: 12 }}>
         <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
           <label style={{ display: "inline-flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
-            <input
-              type="radio"
-              name="mode"
-              value="file"
-              checked={mode === "file"}
-              onChange={() => setMode("file")}
-            />
+            <input type="radio" name="mode" value="file" checked={mode === "file"} onChange={() => setMode("file")} />
             <span style={{ color: "#f8fafc" }}>Upload PDF file</span>
           </label>
 
           <label style={{ display: "inline-flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
-            <input
-              type="radio"
-              name="mode"
-              value="url"
-              checked={mode === "url"}
-              onChange={() => setMode("url")}
-            />
+            <input type="radio" name="mode" value="url" checked={mode === "url"} onChange={() => setMode("url")} />
             <span style={{ color: "#f8fafc" }}>Paste PDF URL</span>
           </label>
         </div>
@@ -202,11 +192,7 @@ export default function UploadPage() {
           {mode === "file" ? (
             <label>
               <div style={{ fontSize: 12, marginBottom: 6, color: "rgba(248,250,252,.78)" }}>PDF file (required)</div>
-              <input
-                type="file"
-                accept="application/pdf,.pdf"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
-              />
+              <input type="file" accept="application/pdf,.pdf" onChange={(e) => setFile(e.target.files?.[0] || null)} />
               {file ? (
                 <div style={{ marginTop: 6, fontSize: 12, color: "rgba(248,250,252,.78)" }}>
                   Selected: {file.name} ({Math.round(file.size / 1024)} KB)
@@ -223,7 +209,6 @@ export default function UploadPage() {
                 style={{ width: "100%", padding: 10, borderRadius: 10 }}
                 required
               />
-              {/* IMPORTANT: warning ONLY in URL mode */}
               {pdfUrl && !/\.pdf(\?|#|$)/i.test(pdfUrl) ? (
                 <div style={{ marginTop: 8, fontSize: 12, color: "rgba(248,250,252,.72)" }}>
                   Tip: viewer links often fail. Prefer a direct “.pdf” download URL, or switch to file upload.
