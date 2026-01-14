@@ -1,57 +1,92 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
+import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /* =========================================================
-   AUTH (dual mode)
+   AUTH (true dual mode)
    - System: x-ingest-secret === INGEST_SECRET
-   - User: Supabase cookie session
+   - User (cookie): Supabase cookie session
+   - User (bearer): Authorization: Bearer <access_token>
 ========================================================= */
 
-function mustEnv(name) {
+function mustEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing ${name}`);
   return v;
 }
 
-function json(status, payload) {
-  return NextResponse.json(payload, { status, headers: { "Cache-Control": "no-store" } });
+function json(status: number, payload: any) {
+  return NextResponse.json(payload, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
-function safeText(v) {
+function safeText(v: any) {
   return typeof v === "string" ? v : "";
 }
 
-async function requireSystemOrUser(req) {
+function readBearer(req: Request) {
+  const h = safeText(req.headers.get("authorization")).trim();
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m?.[1]?.trim() || "";
+}
+
+type AuthResult =
+  | { ok: true; mode: "system"; userId: null }
+  | { ok: true; mode: "user"; userId: string }
+  | { ok: false; status: number; error: string; detail?: any };
+
+async function requireSystemOrUser(req: Request): Promise<AuthResult> {
+  // 1) System secret bypass
   const provided = safeText(req.headers.get("x-ingest-secret")).trim();
   const expected = safeText(process.env.INGEST_SECRET).trim();
-
-  // System secret bypass
   if (expected && provided && provided === expected) {
     return { ok: true, mode: "system", userId: null };
   }
 
-  // User cookie auth (browser)
+  // 2) Bearer token auth (important for API calls without cookies)
+  const bearer = readBearer(req);
+  if (bearer) {
+    try {
+      const supabaseUrl = mustEnv("NEXT_PUBLIC_SUPABASE_URL");
+      const supabaseAnon = mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY");
+
+      const supabaseJwt = createClient(supabaseUrl, supabaseAnon, {
+        auth: { persistSession: false },
+      });
+
+      const { data, error } = await supabaseJwt.auth.getUser(bearer);
+      if (!error && data?.user?.id) {
+        return { ok: true, mode: "user", userId: data.user.id };
+      }
+
+      // If bearer is present but invalid, treat as unauthorized
+      return { ok: false, status: 401, error: "Unauthorized" };
+    } catch (e: any) {
+      return { ok: false, status: 401, error: "Unauthorized" };
+    }
+  }
+
+  // 3) Cookie session auth (browser)
   const cookieStore = cookies();
-  const res = NextResponse.next();
 
   const supabase = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
     mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
     {
       cookies: {
-        get(name) {
+        get(name: string) {
           return cookieStore.get(name)?.value;
         },
-        set(name, value, options) {
-          res.cookies.set({ name, value, ...options });
-        },
-        remove(name, options) {
-          res.cookies.set({ name, value: "", ...options, maxAge: 0 });
-        },
+        // Route handlers aren’t returning a mutable response here,
+        // so set/remove are no-ops (fine for getUser()).
+        set() {},
+        remove() {},
       },
     }
   );
@@ -63,12 +98,12 @@ async function requireSystemOrUser(req) {
 }
 
 /* =========================================================
-   CourtListener Search API (v4) + hardened parsing (JS)
+   CourtListener Search API (v4) + hardened parsing (unchanged)
 ========================================================= */
 
 const BASE = process.env.COURTLISTENER_BASE || "https://www.courtlistener.com/api/rest/v4";
 
-const REGION_COURTS = {
+const REGION_COURTS: Record<string, string[]> = {
   mi_state_only: ["mich", "michctapp"],
   mi_federal: ["mied", "miwd", "ca6"],
   mi_state_and_federal: ["mich", "michctapp", "mied", "miwd", "ca6"],
@@ -90,29 +125,25 @@ const LIMIT_MIN = 1;
 const LIMIT_MAX = 50;
 const LIMIT_DEFAULT = 10;
 
-const uniq = (arr) => [...new Set((arr || []).filter(Boolean))];
+const uniq = (arr: any[]) => [...new Set((arr || []).filter(Boolean))];
 
-const clampInt = (n, min, max, d) => {
+const clampInt = (n: any, min: number, max: number, d: number) => {
   const x = Number(n);
   return Number.isFinite(x) ? Math.min(Math.max(Math.trunc(x), min), max) : d;
 };
 
-const splitCsv = (v) =>
-  typeof v === "string"
-    ? v.split(",").map((s) => s.trim()).filter(Boolean)
-    : [];
+const splitCsv = (v: any) =>
+  typeof v === "string" ? v.split(",").map((s) => s.trim()).filter(Boolean) : [];
 
-function safeLimit(n) {
+function safeLimit(n: any) {
   return clampInt(n, LIMIT_MIN, LIMIT_MAX, LIMIT_DEFAULT);
 }
 
-function isObject(v) {
+function isObject(v: any) {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-/* ------------------ robust body parsing (your original) ------------------ */
-
-function tryJsonParse(s) {
+function tryJsonParse(s: string) {
   try {
     return JSON.parse(s);
   } catch {
@@ -120,7 +151,7 @@ function tryJsonParse(s) {
   }
 }
 
-function tryUnwrapQuotedJson(raw) {
+function tryUnwrapQuotedJson(raw: any) {
   let s = safeText(raw).trim();
   if (!s) return null;
 
@@ -142,12 +173,12 @@ function tryUnwrapQuotedJson(raw) {
   return null;
 }
 
-function tryFormUrlEncoded(raw) {
+function tryFormUrlEncoded(raw: any) {
   const s = safeText(raw).trim();
   if (!s || !s.includes("=")) return null;
   try {
     const sp = new URLSearchParams(s);
-    const out = {};
+    const out: any = {};
     for (const [k, v] of sp.entries()) out[k] = v;
     return out;
   } catch {
@@ -155,14 +186,14 @@ function tryFormUrlEncoded(raw) {
   }
 }
 
-function tryLooseObject(raw) {
+function tryLooseObject(raw: any) {
   const s = safeText(raw).trim();
   if (!s.startsWith("{") || !s.endsWith("}")) return null;
 
   const inner = s.slice(1, -1).trim();
   if (!inner) return null;
 
-  const out = {};
+  const out: any = {};
   const parts = inner.split(",").map((p) => p.trim()).filter(Boolean);
   for (const p of parts) {
     const idx = p.indexOf(":");
@@ -174,7 +205,7 @@ function tryLooseObject(raw) {
   return Object.keys(out).length ? out : null;
 }
 
-async function readBodyBestEffort(req) {
+async function readBodyBestEffort(req: Request) {
   const contentType = safeText(req.headers.get("content-type")).toLowerCase();
 
   let raw = "";
@@ -186,7 +217,7 @@ async function readBodyBestEffort(req) {
 
   const rawPreview = raw.length > 240 ? raw.slice(0, 240) : raw;
 
-  let parsed = tryJsonParse(raw);
+  let parsed: any = tryJsonParse(raw);
   if (!parsed) parsed = tryUnwrapQuotedJson(raw);
 
   if (!parsed && contentType.includes("application/x-www-form-urlencoded")) {
@@ -200,7 +231,7 @@ async function readBodyBestEffort(req) {
   return { parsed, rawPreview, contentType };
 }
 
-function pickQ(body) {
+function pickQ(body: any) {
   const q =
     (typeof body.q === "string" && body.q) ||
     (typeof body.query === "string" && body.query) ||
@@ -210,15 +241,13 @@ function pickQ(body) {
   return q.trim();
 }
 
-/* ------------------ upstream query building (your original) ------------------ */
-
-function buildCourtClause(courts) {
+function buildCourtClause(courts: any[]) {
   const list = uniq((courts || []).map((x) => safeText(x).trim().toLowerCase()).filter(Boolean));
   if (!list.length) return "";
   return ` AND (${list.map((c) => `court_id:"${c}"`).join(" OR ")})`;
 }
 
-function buildDateClause(filedAfter, filedBefore) {
+function buildDateClause(filedAfter: any, filedBefore: any) {
   const a = safeText(filedAfter).trim();
   const b = safeText(filedBefore).trim();
   if (a && b) return ` AND dateFiled:[${a} TO ${b}]`;
@@ -227,7 +256,7 @@ function buildDateClause(filedAfter, filedBefore) {
   return "";
 }
 
-function buildEffectiveQuery({ q, mode, courts, filedAfter, filedBefore }) {
+function buildEffectiveQuery({ q, mode, courts, filedAfter, filedBefore }: any) {
   const query = safeText(q).trim();
   if (!query) return "";
 
@@ -244,7 +273,7 @@ function buildEffectiveQuery({ q, mode, courts, filedAfter, filedBefore }) {
   return clause;
 }
 
-function applyOrderBy(url, sort) {
+function applyOrderBy(url: URL, sort: any) {
   const s = safeText(sort).trim();
   if (s === "dateFiled_desc") url.searchParams.set("order_by", "dateFiled desc");
   else if (s === "dateFiled_asc") url.searchParams.set("order_by", "dateFiled asc");
@@ -252,7 +281,7 @@ function applyOrderBy(url, sort) {
   else if (s === "citeCount_asc") url.searchParams.set("order_by", "citeCount asc");
 }
 
-async function upstreamJson(url, token) {
+async function upstreamJson(url: string, token: string) {
   const res = await fetch(url, {
     headers: { Authorization: `Token ${token}`, Accept: "application/json" },
     cache: "no-store",
@@ -272,9 +301,7 @@ async function upstreamJson(url, token) {
   return { ok: true, status: 200, data };
 }
 
-/* ------------------ normalization (your original) ------------------ */
-
-function pickFirstDownloadUrl(item) {
+function pickFirstDownloadUrl(item: any) {
   const opinions = Array.isArray(item?.opinions) ? item.opinions : [];
   for (const op of opinions) {
     const u = typeof op?.download_url === "string" ? op.download_url : "";
@@ -283,7 +310,7 @@ function pickFirstDownloadUrl(item) {
   return null;
 }
 
-function extractOpinionId(item) {
+function extractOpinionId(item: any) {
   const opinions = Array.isArray(item?.opinions) ? item.opinions : [];
   const first = opinions[0] || {};
   if (typeof first?.id === "number") return first.id;
@@ -291,7 +318,7 @@ function extractOpinionId(item) {
   return null;
 }
 
-function normalize(item) {
+function normalize(item: any) {
   return {
     id: item?.cluster_id ?? null,
     caseName: safeText(item?.caseName),
@@ -312,8 +339,7 @@ function normalize(item) {
    ROUTES
 ========================================================= */
 
-export async function GET(req) {
-  // Auth required even for GET (so users don’t leak tokenPresent/base info publicly)
+export async function GET(req: Request) {
   const auth = await requireSystemOrUser(req);
   if (auth.ok === false) return json(auth.status, { ok: false, error: auth.error });
 
@@ -324,7 +350,7 @@ export async function GET(req) {
   });
 }
 
-export async function POST(req) {
+export async function POST(req: Request) {
   const auth = await requireSystemOrUser(req);
   if (auth.ok === false) return json(auth.status, { ok: false, error: auth.error });
 
@@ -334,7 +360,7 @@ export async function POST(req) {
   const { parsed: body, rawPreview, contentType } = await readBodyBestEffort(req);
 
   const u = new URL(req.url);
-  const urlParams = {
+  const urlParams: any = {
     q: u.searchParams.get("q") || u.searchParams.get("query") || "",
     mode: u.searchParams.get("mode") || "",
     region: u.searchParams.get("region") || "",
@@ -345,7 +371,7 @@ export async function POST(req) {
     limit: u.searchParams.get("limit") || "",
   };
 
-  const merged = { ...urlParams, ...(isObject(body) ? body : {}) };
+  const merged: any = { ...urlParams, ...(isObject(body) ? body : {}) };
 
   const q = pickQ(merged);
   const mode = merged.mode === "party" || merged.mode === "topic" ? merged.mode : "topic";
@@ -359,12 +385,12 @@ export async function POST(req) {
   const filedAfter = typeof merged.filedAfter === "string" ? merged.filedAfter.trim() : "";
   const filedBefore = typeof merged.filedBefore === "string" ? merged.filedBefore.trim() : "";
 
-  let courts = [];
+  let courts: any[] = [];
   if (Array.isArray(merged.courts)) courts = merged.courts;
   else if (typeof merged.courts === "string") courts = splitCsv(merged.courts);
 
-  const defaultCourts = REGION_COURTS[region] || REGION_COURTS.mi_state_only;
-  const finalCourts = uniq((courts.length ? courts : defaultCourts).map((x) => safeText(x)));
+  const defaultCourts = (REGION_COURTS as any)[region] || REGION_COURTS.mi_state_only;
+  const finalCourts = uniq((courts.length ? courts : defaultCourts).map((x: any) => safeText(x)));
 
   if (!q) {
     return json(400, {
@@ -386,9 +412,9 @@ export async function POST(req) {
   applyOrderBy(url, sort);
 
   const up = await upstreamJson(url.toString(), token);
-  if (!up.ok) return json(502, { ok: false, kind: "search", ...up });
+  if (!(up as any).ok) return json(502, { ok: false, kind: "search", ...(up as any) });
 
-  const raw = Array.isArray(up.data?.results) ? up.data.results : [];
+  const raw = Array.isArray((up as any).data?.results) ? (up as any).data.results : [];
   const results = raw.slice(0, limit).map(normalize);
 
   return json(200, {
@@ -403,7 +429,7 @@ export async function POST(req) {
     filedBefore: filedBefore || null,
     limit,
     debug: { effectiveQuery },
-    count: Number(up.data?.count || results.length),
+    count: Number((up as any).data?.count || results.length),
     results,
   });
 }
