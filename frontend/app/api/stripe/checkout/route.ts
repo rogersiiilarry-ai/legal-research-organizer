@@ -8,10 +8,16 @@ import { createClient } from "@supabase/supabase-js";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+/* ------------------------------- helpers ------------------------------- */
+
 function json(status: number, payload: any) {
   return NextResponse.json(payload, {
     status,
-    headers: { "Cache-Control": "no-store" },
+    headers: {
+      "Cache-Control": "no-store",
+      // fingerprint so we can prove prod is hitting THIS handler
+      "x-checkout-handler": "stripe-checkout-route-ts-2026-01-13-A",
+    },
   });
 }
 
@@ -21,8 +27,12 @@ function mustEnv(name: string) {
   return v;
 }
 
+function safeStr(v: any) {
+  return typeof v === "string" ? v.trim() : "";
+}
+
 function normalizeTier(v: any): "basic" | "pro" {
-  const s = String(v || "").toLowerCase().trim();
+  const s = safeStr(v).toLowerCase();
   return s === "pro" ? "pro" : "basic";
 }
 
@@ -48,22 +58,34 @@ async function requireUser() {
   return data.user;
 }
 
+/* --------------------------------- route -------------------------------- */
+
 export async function POST(req: Request) {
   try {
     const user = await requireUser();
     if (!user) return json(401, { ok: false, error: "Unauthorized" });
 
     const body = await req.json().catch(() => ({}));
-    const analysisId = String(body?.analysis_id || body?.analysisId || "").trim();
+
+    const analysisId = safeStr(body?.analysis_id || body?.analysisId);
     const tier = normalizeTier(body?.tier);
 
     if (!analysisId) return json(400, { ok: false, error: "analysis_id required" });
 
+    const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"));
+
     const priceId = tier === "pro" ? mustEnv("STRIPE_PRICE_PRO") : mustEnv("STRIPE_PRICE_BASIC");
 
-    // If you want to pin apiVersion safely, use the config object:
-    // const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), { apiVersion: "2024-06-20" });
-    const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"));
+    // sanity check so you never see “subscription mode requires recurring price”
+    // unless you're NOT hitting this handler or your env points to wrong price.
+    const price = await stripe.prices.retrieve(priceId);
+    if (price.recurring) {
+      return json(500, {
+        ok: false,
+        error: "STRIPE_PRICE_* is recurring. This endpoint uses mode=payment and requires a one-time price.",
+        debug: { priceId, recurring: price.recurring },
+      });
+    }
 
     const admin = createClient(
       mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
@@ -71,6 +93,7 @@ export async function POST(req: Request) {
       { auth: { persistSession: false } }
     );
 
+    // Persist requested tier on the analysis (unpaid)
     const { data: analysis, error: readErr } = await admin
       .from("analyses")
       .select("meta")
@@ -94,7 +117,7 @@ export async function POST(req: Request) {
       mode: "payment",
       line_items: [{ price: priceId, quantity: 1 }],
 
-      // FIX: match what the UI reads (analysisId) and match your actual route (/audit)
+      // match the UI route you actually have (/audit)
       success_url: `${siteUrl}/audit?analysisId=${encodeURIComponent(analysisId)}&paid=1`,
       cancel_url: `${siteUrl}/audit?analysisId=${encodeURIComponent(analysisId)}&canceled=1`,
 
