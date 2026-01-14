@@ -8,8 +8,6 @@ import { createClient } from "@supabase/supabase-js";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/* ------------------------------- helpers ------------------------------- */
-
 function json(status: number, payload: any) {
   return NextResponse.json(payload, {
     status,
@@ -39,8 +37,6 @@ async function requireUser() {
         get(name: string) {
           return cookieStore.get(name)?.value;
         },
-        // NOTE: In Route Handlers, cookie refresh isn't always reliable.
-        // We rely on existing session cookies.
         set() {},
         remove() {},
       },
@@ -51,8 +47,6 @@ async function requireUser() {
   if (error || !data?.user) return null;
   return data.user;
 }
-
-/* --------------------------------- route -------------------------------- */
 
 export async function POST(req: Request) {
   try {
@@ -67,8 +61,8 @@ export async function POST(req: Request) {
 
     const priceId = tier === "pro" ? mustEnv("STRIPE_PRICE_PRO") : mustEnv("STRIPE_PRICE_BASIC");
 
-    // IMPORTANT: do NOT pin apiVersion here; your installed Stripe typings
-    // require a specific literal value and will break builds if mismatched.
+    // If you want to pin apiVersion safely, use the config object:
+    // const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"), { apiVersion: "2024-06-20" });
     const stripe = new Stripe(mustEnv("STRIPE_SECRET_KEY"));
 
     const admin = createClient(
@@ -77,7 +71,6 @@ export async function POST(req: Request) {
       { auth: { persistSession: false } }
     );
 
-    // Persist requested tier (unpaid) on the analysis
     const { data: analysis, error: readErr } = await admin
       .from("analyses")
       .select("meta")
@@ -100,8 +93,11 @@ export async function POST(req: Request) {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${siteUrl}/app/audit?analysis_id=${encodeURIComponent(analysisId)}&paid=1`,
-      cancel_url: `${siteUrl}/app/audit?analysis_id=${encodeURIComponent(analysisId)}&canceled=1`,
+
+      // FIX: match what the UI reads (analysisId) and match your actual route (/audit)
+      success_url: `${siteUrl}/audit?analysisId=${encodeURIComponent(analysisId)}&paid=1`,
+      cancel_url: `${siteUrl}/audit?analysisId=${encodeURIComponent(analysisId)}&canceled=1`,
+
       client_reference_id: analysisId,
       metadata: {
         analysis_id: analysisId,
