@@ -1,7 +1,7 @@
 ﻿"use client";
 
 // frontend/app/(shell)/audit/AuditClient.tsx
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 /* ------------------------------ small utils ------------------------------ */
@@ -82,8 +82,14 @@ type ExecuteResponse = {
   ok?: boolean;
   error?: string;
   message?: string;
+
+  // payment gate signals (your server may return 200 with these)
+  requires_payment?: boolean;
+  code?: string;
+
   findings?: Finding[];
   tier?: "basic" | "pro" | string;
+  exportAllowed?: boolean;
   summary?: string;
 };
 
@@ -91,6 +97,13 @@ type MaterializeResponse = {
   ok?: boolean;
   analysisId?: string;
   analysis_id?: string;
+  error?: string;
+  message?: string;
+};
+
+type CheckoutResponse = {
+  ok?: boolean;
+  url?: string;
   error?: string;
   message?: string;
 };
@@ -286,6 +299,20 @@ export default function AuditClient() {
     return await fetchJson<AnalysisResponse>(`/api/analyses/${encodeURIComponent(id)}`);
   }
 
+  async function startCheckout(analysisId: string, tier: "basic" | "pro") {
+    const cj = await fetchJson<CheckoutResponse>("/api/stripe/checkout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ analysisId, tier }),
+    });
+
+    const url = safeStr(cj?.url).trim();
+    if (!url) throw new Error(cj?.error || cj?.message || "Failed to start checkout");
+
+    // redirect to Stripe
+    window.location.assign(url);
+  }
+
   /* ------------------------------ load documents ------------------------------ */
 
   useEffect(() => {
@@ -429,10 +456,16 @@ export default function AuditClient() {
 
       const exec = (await res.json().catch(() => ({}))) as ExecuteResponse;
 
-      if (res.status === 402) {
-        setUiErr(
-          `Payment required. Set analyses.meta.paid=true and analyses.meta.tier="${tierChoice}" for this analysis, then click Refresh.`
-        );
+      const requiresPayment =
+        res.status === 402 ||
+        exec?.requires_payment === true ||
+        String(exec?.code || "").toUpperCase() === "PAYMENT_REQUIRED";
+
+      if (requiresPayment) {
+        // Do not instruct manual DB edits; initiate checkout flow.
+        setErr("");
+        setInfo("Payment required. Redirecting to Stripe Checkout…");
+        await startCheckout(id, tierChoice);
         return;
       }
 
@@ -586,13 +619,7 @@ export default function AuditClient() {
         </div>
 
         <div style={{ marginTop: 10, color: "rgba(248,250,252,.78)", fontSize: 13 }}>
-          If you get <strong>Payment required</strong>, set{" "}
-          <code style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>analyses.meta.paid=true</code>{" "}
-          and{" "}
-          <code style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-            analyses.meta.tier="{tierChoice}"
-          </code>{" "}
-          for this analysis, then click Refresh.
+          If you are redirected to Stripe, complete checkout and return here. The webhook will mark the analysis paid.
         </div>
       </div>
 
@@ -600,7 +627,9 @@ export default function AuditClient() {
       {info ? <div style={{ marginBottom: 14, color: "rgba(248,250,252,.85)" }}>{info}</div> : null}
 
       {!analysisPayload ? (
-        <div style={{ opacity: 0.75, color: "rgba(248,250,252,.78)" }}>No analysis loaded yet. Materialize a document above.</div>
+        <div style={{ opacity: 0.75, color: "rgba(248,250,252,.78)" }}>
+          No analysis loaded yet. Materialize a document above.
+        </div>
       ) : (
         <div className="card">
           {/* Header row */}
@@ -646,7 +675,15 @@ export default function AuditClient() {
           <hr style={{ border: 0, borderTop: "1px solid rgba(255,255,255,.12)", margin: "16px 0" }} />
 
           {/* Findings header */}
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
             <h2 style={{ fontSize: 16, margin: 0, color: "#f8fafc" }}>
               Findings {findings.length ? `(${findings.length})` : ""}
             </h2>
@@ -712,7 +749,9 @@ export default function AuditClient() {
               })}
             </div>
           ) : (
-            <div style={{ marginTop: 10, color: "rgba(248,250,252,.78)" }}>No findings yet. If you just executed, click Refresh.</div>
+            <div style={{ marginTop: 10, color: "rgba(248,250,252,.78)" }}>
+              No findings yet. If you just executed, click Refresh.
+            </div>
           )}
         </div>
       )}
