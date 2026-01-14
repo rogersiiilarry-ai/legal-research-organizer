@@ -45,10 +45,6 @@ function normalizeTier(v: any): "basic" | "pro" {
   return t === "pro" ? "pro" : "basic";
 }
 
-function isUuid(v: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v || "");
-}
-
 /* -------------------------------- auth -------------------------------- */
 
 type AuthOk =
@@ -74,7 +70,6 @@ async function requireSystemOrUser(req: Request): Promise<Auth> {
   // user cookie auth
   const cookieStore = cookies();
 
-  // IMPORTANT: set/remove must be implemented for Supabase refresh to work
   const supabaseAuth = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
     mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
@@ -162,6 +157,24 @@ function resolveAccess(input: {
 
   const tier = normalizeTier(analysisMeta?.tier);
   return { allowed: true as const, tier, isAdmin: false as const, exportAllowed: tier === "pro" };
+}
+
+/* ----------------------- analysis canonical resolver ----------------------- */
+
+async function resolveAnalysisByIdOrRunId(supabase: any, provided: string) {
+  // NOTE:
+  // - If provided is a UUID, id.eq works
+  // - If provided is a run_id (non-uuid), run_id.eq works
+  // - If both could match (rare), order by created_at desc and take latest
+  const { data, error } = await supabase
+    .from("analyses")
+    .select("id, owner_id, target_document_id, status, summary, meta, created_at")
+    .or(`id.eq.${provided},run_id.eq.${provided}`)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return { data, error };
 }
 
 /* ---------------------------- audit logic (deterministic) ---------------------------- */
@@ -264,9 +277,8 @@ export async function POST(req: Request) {
 
     const body = await readJson(req);
 
-    const analysisId = safeStr(body?.analysisId ?? body?.analysis_id ?? "", 80);
-    if (!analysisId) return json(400, { ok: false, error: "analysisId is required" });
-    if (!isUuid(analysisId)) return json(400, { ok: false, error: "analysisId must be a UUID" });
+    const providedId = safeStr(body?.analysisId ?? body?.analysis_id ?? "", 120);
+    if (!providedId) return json(400, { ok: false, error: "analysisId is required" });
 
     const supabase = createClient(
       mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
@@ -274,14 +286,12 @@ export async function POST(req: Request) {
       { auth: { persistSession: false } }
     );
 
-    const { data: analysis, error: aErr } = await supabase
-      .from("analyses")
-      .select("id, owner_id, target_document_id, status, summary, meta")
-      .eq("id", analysisId)
-      .maybeSingle();
-
+    // Resolve canonical analysis row (id OR run_id)
+    const { data: analysis, error: aErr } = await resolveAnalysisByIdOrRunId(supabase, providedId);
     if (aErr) return json(500, { ok: false, error: aErr.message });
     if (!analysis) return json(404, { ok: false, error: "Analysis not found" });
+
+    const analysisId = String(analysis.id); // canonical persisted ID
 
     // owner check (user mode)
     if (auth.mode === "user" && analysis.owner_id && analysis.owner_id !== auth.userId) {
@@ -297,13 +307,10 @@ export async function POST(req: Request) {
       dbEntitlement,
     });
 
-    // IMPORTANT:
-    // Returning 200 with requires_payment keeps your current UI behavior.
-    // If you prefer HTTP 402, change this here.
     if (!access.allowed) {
-      return json(200, {
-        ok: true,
-        requires_payment: true,
+      return json(402, {
+        ok: false,
+        error: "Payment required",
         code: "PAYMENT_REQUIRED",
         analysisId,
       });
@@ -338,17 +345,10 @@ export async function POST(req: Request) {
       stats: { chunkCount, statementEstimate: joined ? statementCount : 0 },
     };
 
-    let status = "done";
-    let summary: string;
-
-    if (!joined) {
-      summary = "No text available to audit (no chunks found). Materialize the document first.";
-    } else {
-      summary =
-        `Audit executed (${access.tier.toUpperCase()}). ` +
-        `Coverage: ${chunkCount} chunks parsed (~${statementCount} statements). ` +
-        `Findings generated: ${findings.length}.`;
-    }
+    const status = "done";
+    const summary = !joined
+      ? "No text available to audit (no chunks found). Materialize the document first."
+      : `Audit executed (${access.tier.toUpperCase()}). Coverage: ${chunkCount} chunks parsed (~${statementCount} statements). Findings generated: ${findings.length}.`;
 
     const { error: uErr } = await supabase
       .from("analyses")
