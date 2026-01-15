@@ -1,7 +1,7 @@
 ﻿"use client";
 
 // frontend/app/(shell)/audit/AuditClient.tsx
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 /* ------------------------------ small utils ------------------------------ */
@@ -78,6 +78,14 @@ type AnalysisResponse = {
   export_allowed?: boolean;
 };
 
+type MaterializeResponse = {
+  ok?: boolean;
+  analysisId?: string;
+  analysis_id?: string;
+  error?: string;
+  message?: string;
+};
+
 type ExecuteResponse = {
   ok?: boolean;
   error?: string;
@@ -91,29 +99,8 @@ type ExecuteResponse = {
   exportAllowed?: boolean;
   summary?: string;
 
-  // in case server returns it
   checkout_url?: string;
   url?: string;
-};
-
-type MaterializeResponse = {
-  ok?: boolean;
-  analysisId?: string;
-  analysis_id?: string;
-  error?: string;
-  message?: string;
-
-  // paywall return
-  checkout_url?: string;
-  url?: string;
-};
-
-type CheckoutResponse = {
-  ok?: boolean;
-  url?: string;
-  checkout_url?: string;
-  error?: string;
-  message?: string;
 };
 
 /* ------------------------------ helpers ------------------------------ */
@@ -216,9 +203,11 @@ function formatSummary(analysisRow: AnalysisRow | null) {
   return s || "—";
 }
 
-function pickCheckoutUrl(payload: any): string {
-  const u = safeStr(payload?.checkout_url || payload?.url).trim();
-  return u;
+function stripeLinkForTier(tier: "basic" | "pro") {
+  // Your provided Payment Links:
+  return tier === "pro"
+    ? "https://buy.stripe.com/3cIcN46YGf7Acx599V0x201" // 100
+    : "https://buy.stripe.com/fZu28qfvcf7AdB9adZ0x200"; // 50
 }
 
 /* ------------------------------ component ------------------------------ */
@@ -227,8 +216,11 @@ export default function AuditClient() {
   const router = useRouter();
   const sp = useSearchParams();
 
+  // If you configure Stripe Payment Link success URL to:
+  //   /audit?paid=basic   and /audit?paid=pro
+  // then "paid" will be "basic" or "pro" when the user returns.
+  const paidMarker = (sp.get("paid") || "").trim().toLowerCase(); // "basic" | "pro" | ""
   const analysisIdFromQuery = (sp.get("analysisId") || "").trim();
-  const initialDocId = (sp.get("documentId") || sp.get("document_id") || "").trim();
 
   const [docs, setDocs] = useState<DocumentRow[]>([]);
   const [docId, setDocId] = useState<string>("");
@@ -243,6 +235,9 @@ export default function AuditClient() {
   const [runningExecute, setRunningExecute] = useState<boolean>(false);
 
   const [tierChoice, setTierChoice] = useState<"basic" | "pro">("basic");
+
+  // Prevent double auto-materialize on return
+  const didAutoMaterializeRef = useRef(false);
 
   function setUiErr(message: unknown) {
     setErr(normalizeUiError(message));
@@ -264,19 +259,6 @@ export default function AuditClient() {
     return await fetchJsonOk<AnalysisResponse>(`/api/analyses/${encodeURIComponent(id)}`);
   }
 
-  async function startCheckout(analysisId: string, tier: "basic" | "pro") {
-    const cj = await fetchJsonOk<CheckoutResponse>("/api/stripe/checkout", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ analysisId, tier }),
-    });
-
-    const url = pickCheckoutUrl(cj);
-    if (!url) throw new Error(cj?.error || cj?.message || "Failed to start checkout");
-
-    window.location.assign(url);
-  }
-
   /* ------------------------------ load documents ------------------------------ */
 
   useEffect(() => {
@@ -294,11 +276,10 @@ export default function AuditClient() {
 
         setDocs(list);
 
-        if (initialDocId && list.some((d) => d.id === initialDocId)) {
-          setDocId(initialDocId);
-        } else {
-          setDocId(list?.[0]?.id || "");
-        }
+        // If URL contains documentId, prefer it; otherwise choose first doc.
+        const urlDocId = (sp.get("documentId") || sp.get("document_id") || "").trim();
+        if (urlDocId && list.some((d) => d.id === urlDocId)) setDocId(urlDocId);
+        else setDocId(list?.[0]?.id || "");
       } catch (e: any) {
         if (!cancelled) setUiErr(e?.message || "Failed to load documents");
       } finally {
@@ -364,18 +345,11 @@ export default function AuditClient() {
     return !!id && !runningMaterialize && !runningExecute;
   }, [analysisPayload, analysisIdFromQuery, runningMaterialize, runningExecute]);
 
-  /* ------------------------------ actions ------------------------------ */
+  /* ------------------------------ materialize helpers ------------------------------ */
 
-  async function onMaterialize(e: React.FormEvent) {
-    e.preventDefault();
-    setErr("");
-    setInfo("");
-
-    if (!docId) return setUiErr("document_id is required");
-
+  async function materializeNow(document_id: string, tier: "basic" | "pro") {
     setRunningMaterialize(true);
     try {
-      // IMPORTANT: do NOT use fetchJsonOk here because we must handle 402 payload.
       const res = await fetch("/api/research", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -383,23 +357,15 @@ export default function AuditClient() {
         cache: "no-store",
         body: JSON.stringify({
           mode: "materialize-and-run",
-          document_id: docId,
+          document_id,
           kind: "case_fact_audit",
-          tier: tierChoice, // let server know which checkout price to use
-          withPdf: tierChoice === "pro",
+          tier,
+          withPdf: tier === "pro",
           materialize: { maxChars: 4000, maxChunks: 250, timeoutMs: 45000 },
         }),
       });
 
       const j = (await res.json().catch(() => ({}))) as MaterializeResponse;
-
-      // If unpaid, redirect immediately to Stripe
-      if (res.status === 402) {
-        const checkoutUrl = pickCheckoutUrl(j);
-        if (!checkoutUrl) throw new Error(j?.error || j?.message || "Payment required, but no checkout URL returned");
-        window.location.assign(checkoutUrl);
-        return;
-      }
 
       if (!res.ok) {
         throw new Error((j as any)?.error || (j as any)?.message || `Materialize failed (${res.status})`);
@@ -412,11 +378,51 @@ export default function AuditClient() {
       router.refresh();
 
       setInfo("Materialized successfully. Next step: execute the audit to generate findings.");
-    } catch (e2: any) {
-      setUiErr(e2?.message || "Materialize failed");
     } finally {
       setRunningMaterialize(false);
     }
+  }
+
+  // Auto-materialize after Stripe return:
+  // /audit?paid=basic or /audit?paid=pro
+  //
+  // We wait until:
+  //  - docs are loaded and docId is selected
+  //  - no analysisId is already loaded
+  //  - and we only run once
+  useEffect(() => {
+    const paidTier = paidMarker === "basic" || paidMarker === "pro" ? (paidMarker as "basic" | "pro") : null;
+    if (!paidTier) return;
+    if (didAutoMaterializeRef.current) return;
+    if (analysisIdFromQuery) return;
+    if (loadingDocs) return;
+    if (!docId) return;
+
+    didAutoMaterializeRef.current = true;
+    setErr("");
+    setInfo("Payment received. Running materialize...");
+    materializeNow(docId, paidTier).catch((e: any) => setUiErr(e?.message || "Materialize failed"));
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paidMarker, loadingDocs, docId, analysisIdFromQuery]);
+
+  /* ------------------------------ actions ------------------------------ */
+
+  async function onMaterialize(e: React.FormEvent) {
+    e.preventDefault();
+    setErr("");
+    setInfo("");
+
+    if (!docId) return setUiErr("document_id is required");
+
+    // Always go to Stripe first (Payment Links).
+    // Configure Stripe Payment Link success URL to:
+    //   https://legal-research-organizer.vercel.app/audit?paid=basic
+    //   https://legal-research-organizer.vercel.app/audit?paid=pro
+    //
+    // On return, we auto-materialize using the currently selected docId.
+    const stripeUrl = stripeLinkForTier(tierChoice);
+    window.location.assign(stripeUrl);
   }
 
   async function onExecute(e: React.MouseEvent<HTMLButtonElement>) {
@@ -445,9 +451,7 @@ export default function AuditClient() {
         String(exec?.code || "").toUpperCase() === "PAYMENT_REQUIRED";
 
       if (requiresPayment) {
-        setErr("");
-        setInfo("Payment required. Redirecting to Stripe Checkout…");
-        await startCheckout(id, tierChoice);
+        setUiErr("Payment required. Please purchase via Step 1 (Pay & Materialize) first.");
         return;
       }
 
@@ -509,9 +513,7 @@ export default function AuditClient() {
 
       {/* Step 1 */}
       <div className="card" style={{ marginBottom: 18 }}>
-        <div style={{ fontWeight: 700, marginBottom: 10, color: "#f8fafc" }}>
-          Step 1 — Materialize (PDF → searchable chunks)
-        </div>
+        <div style={{ fontWeight: 700, marginBottom: 10, color: "#f8fafc" }}>Step 1 — Pay (Stripe) → Materialize</div>
 
         <form onSubmit={onMaterialize}>
           <label style={{ display: "block", marginBottom: 8, fontSize: 13, color: "rgba(248,250,252,.78)" }}>
@@ -541,48 +543,33 @@ export default function AuditClient() {
             ))}
           </select>
 
-          <button
-            type="submit"
-            className="btn btn-ghost"
-            disabled={!canMaterialize}
-            style={{ opacity: canMaterialize ? 1 : 0.6 }}
-          >
-            {runningMaterialize ? "Materializing..." : "Materialize"}
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ fontSize: 13, color: "rgba(248,250,252,.78)" }}>Choose tier:</div>
+
+            <label style={{ display: "inline-flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
+              <input type="radio" name="tier" value="basic" checked={tierChoice === "basic"} onChange={() => setTierChoice("basic")} />
+              <span style={{ color: "#f8fafc" }}>$50 Basic (no PDF)</span>
+            </label>
+
+            <label style={{ display: "inline-flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
+              <input type="radio" name="tier" value="pro" checked={tierChoice === "pro"} onChange={() => setTierChoice("pro")} />
+              <span style={{ color: "#f8fafc" }}>$100 Pro (PDF export)</span>
+            </label>
+          </div>
+
+          <button type="submit" className="btn btn-primary" disabled={!canMaterialize} style={{ opacity: canMaterialize ? 1 : 0.6 }}>
+            {runningMaterialize ? "Materializing..." : "Pay & Materialize"}
           </button>
+
+          <div style={{ marginTop: 10, color: "rgba(248,250,252,.78)", fontSize: 13 }}>
+            This opens Stripe immediately. After payment, you return here and materialize runs automatically using the currently selected document.
+          </div>
         </form>
       </div>
 
       {/* Step 2 */}
       <div className="card" style={{ marginBottom: 18 }}>
-        <div style={{ fontWeight: 700, marginBottom: 10, color: "#f8fafc" }}>
-          Step 2 — Execute (generate findings)
-        </div>
-
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
-          <div style={{ fontSize: 13, color: "rgba(248,250,252,.78)" }}>Choose tier:</div>
-
-          <label style={{ display: "inline-flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
-            <input
-              type="radio"
-              name="tier"
-              value="basic"
-              checked={tierChoice === "basic"}
-              onChange={() => setTierChoice("basic")}
-            />
-            <span style={{ color: "#f8fafc" }}>$50 Basic (no PDF)</span>
-          </label>
-
-          <label style={{ display: "inline-flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
-            <input
-              type="radio"
-              name="tier"
-              value="pro"
-              checked={tierChoice === "pro"}
-              onChange={() => setTierChoice("pro")}
-            />
-            <span style={{ color: "#f8fafc" }}>$100 Pro (PDF export)</span>
-          </label>
-        </div>
+        <div style={{ fontWeight: 700, marginBottom: 10, color: "#f8fafc" }}>Step 2 — Execute (generate findings)</div>
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <button
@@ -599,19 +586,13 @@ export default function AuditClient() {
             Refresh
           </button>
         </div>
-
-        <div style={{ marginTop: 10, color: "rgba(248,250,252,.78)", fontSize: 13 }}>
-          If you are redirected to Stripe, complete checkout and return here. The webhook will mark the analysis paid.
-        </div>
       </div>
 
       {err ? <div style={{ marginBottom: 14, color: "#fca5a5", whiteSpace: "pre-wrap" }}>{err}</div> : null}
       {info ? <div style={{ marginBottom: 14, color: "rgba(248,250,252,.85)" }}>{info}</div> : null}
 
       {!analysisPayload ? (
-        <div style={{ opacity: 0.75, color: "rgba(248,250,252,.78)" }}>
-          No analysis loaded yet. Materialize a document above.
-        </div>
+        <div style={{ opacity: 0.75, color: "rgba(248,250,252,.78)" }}>No analysis loaded yet.</div>
       ) : (
         <div className="card">
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
@@ -625,13 +606,6 @@ export default function AuditClient() {
             <div>
               <div style={{ fontSize: 13, color: "rgba(248,250,252,.78)" }}>Status</div>
               <div style={{ color: "#f8fafc" }}>{formatStatus(analysisRow)}</div>
-            </div>
-
-            <div>
-              <div style={{ fontSize: 13, color: "rgba(248,250,252,.78)" }}>Target document</div>
-              <div style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "#f8fafc" }}>
-                {analysisRow?.target_document_id || "—"}
-              </div>
             </div>
 
             <div>
@@ -649,9 +623,7 @@ export default function AuditClient() {
 
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13, color: "rgba(248,250,252,.78)" }}>Summary</div>
-            <div style={{ marginTop: 4, color: "#f8fafc", whiteSpace: "pre-wrap" }}>
-              {formatSummary(analysisRow)}
-            </div>
+            <div style={{ marginTop: 4, color: "#f8fafc", whiteSpace: "pre-wrap" }}>{formatSummary(analysisRow)}</div>
           </div>
 
           <hr style={{ border: 0, borderTop: "1px solid rgba(255,255,255,.12)", margin: "16px 0" }} />
@@ -721,7 +693,9 @@ export default function AuditClient() {
               })}
             </div>
           ) : (
-            <div style={{ marginTop: 10, color: "rgba(248,250,252,.78)" }}>No findings yet. If you just executed, click Refresh.</div>
+            <div style={{ marginTop: 10, color: "rgba(248,250,252,.78)" }}>
+              No findings yet. If you just executed, click Refresh.
+            </div>
           )}
         </div>
       )}
