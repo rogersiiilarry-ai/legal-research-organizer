@@ -24,7 +24,7 @@ async function readJson(req: Request) {
 }
 
 function originOf(req: Request) {
-  // Vercel/Next: prefer forwarded headers
+  // Prefer forwarded headers on Vercel
   const proto = req.headers.get("x-forwarded-proto") || "https";
   const host = req.headers.get("x-forwarded-host") || req.headers.get("host");
   if (host) return `${proto}://${host}`;
@@ -32,12 +32,17 @@ function originOf(req: Request) {
 }
 
 function forwardHeaders(req: Request) {
-  // Forward session cookies for Supabase auth
+  // Forward:
+  //  - cookies (for user auth flows)
+  //  - x-ingest-secret (for system auth / PowerShell flows)
   const cookie = req.headers.get("cookie") || "";
+  const ingest = req.headers.get("x-ingest-secret") || "";
+
   return {
     "content-type": "application/json",
     accept: "application/json",
     ...(cookie ? { cookie } : {}),
+    ...(ingest ? { "x-ingest-secret": ingest } : {}),
   } as Record<string, string>;
 }
 
@@ -46,12 +51,13 @@ function forwardHeaders(req: Request) {
 /**
  * /api/research is the UI-facing entry point for "Materialize".
  *
- * It MUST:
- *  - call /api/audit/run (the gate that creates analysis + Stripe checkout when unpaid)
- *  - if unpaid: return 402 + checkout_url so the client can redirect to Stripe immediately
- *  - if paid/entitled: return 200 + analysisId
+ * IMPORTANT:
+ * - Do NOT call /api/audit/run (middleware blocks it)
+ * - Call /api/audit/run/materialize-and-run (middleware allows it)
  *
- * It should NOT call /api/audit/execute here (execute is Step 2).
+ * Behavior:
+ * - If unpaid: return 402 + checkout_url so client can redirect to Stripe immediately
+ * - If paid/entitled/system: returns 200 + analysisId
  */
 export async function POST(req: Request) {
   try {
@@ -59,27 +65,24 @@ export async function POST(req: Request) {
     const headers = forwardHeaders(req);
     const origin = originOf(req);
 
-    // Call the gate route that handles:
-    // - create analysis
-    // - Stripe checkout if unpaid
-    // - materialize if entitled
-    const runRes = await fetch(`${origin}/api/audit/run`, {
+    // ✅ Call the allowed materialize-and-run gate
+    const runRes = await fetch(`${origin}/api/audit/run/materialize-and-run`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
       cache: "no-store",
     });
 
-    const runJson = await runRes.json().catch(() => ({}));
+    const runJson = await runRes.json().catch(() => ({} as any));
 
-    // Pass through Stripe paywall response so client can redirect to checkout_url
+    // ✅ Paywall passthrough: client redirects to Stripe immediately
     if (runRes.status === 402) {
       return json(402, {
         ok: false,
         phase: "stripe",
         error: runJson?.error || "Payment required",
         checkout_url: runJson?.checkout_url || runJson?.url || null,
-        analysisId: runJson?.analysisId || runJson?.analysis_id || null,
+        analysisId: runJson?.analysisId || runJson?.analysis_id || runJson?.id || null,
         raw: runJson,
       });
     }
@@ -88,7 +91,7 @@ export async function POST(req: Request) {
     if (!runRes.ok) {
       return json(runRes.status, {
         ok: false,
-        where: "/api/audit/run",
+        where: "/api/audit/run/materialize-and-run",
         ...runJson,
       });
     }
@@ -105,12 +108,11 @@ export async function POST(req: Request) {
     if (!analysisId) {
       return json(500, {
         ok: false,
-        error: "audit/run succeeded but no analysisId was returned",
+        error: "materialize-and-run succeeded but no analysisId was returned",
         raw: runJson,
       });
     }
 
-    // Materialize success: return analysisId only (Step 2 is separate)
     return json(200, {
       ok: true,
       analysisId,
@@ -123,5 +125,9 @@ export async function POST(req: Request) {
 }
 
 export async function GET() {
-  return json(200, { ok: true, route: "/api/research", note: "POST to materialize (Stripe-gated) via /api/audit/run" });
+  return json(200, {
+    ok: true,
+    route: "/api/research",
+    note: "POST to materialize via /api/audit/run/materialize-and-run (Stripe-gated).",
+  });
 }
