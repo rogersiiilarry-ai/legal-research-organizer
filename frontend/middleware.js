@@ -8,6 +8,8 @@ function mustEnv(name) {
   return v;
 }
 
+/* ----------------------------- route groups ---------------------------- */
+
 function isPublicPath(pathname) {
   return (
     pathname === "/" ||
@@ -60,6 +62,8 @@ function isProtectedApp(pathname) {
   );
 }
 
+/* ------------------------------- helpers ------------------------------- */
+
 function checkSystemSecret(req) {
   const provided = req.headers.get("x-ingest-secret") || "";
   const expected = process.env.INGEST_SECRET || "";
@@ -67,20 +71,24 @@ function checkSystemSecret(req) {
   return provided === expected;
 }
 
-export async function middleware(req) {
-  const { pathname } = req.nextUrl;
-
-  // -------------------------------------------------------------------
-  // HARD BYPASS: must be reachable without Supabase cookie auth
-  // -------------------------------------------------------------------
-  if (
+function isHardBypass(pathname) {
+  // MUST be reachable without Supabase cookie auth
+  return (
     pathname === "/api/purchase/token" ||
     pathname === "/api/stripe/webhook" ||
     pathname === "/api/debug/supabase" ||
-    pathname === "/api/debug/analysis-exists"
-  ) {
-    return NextResponse.next();
-  }
+    pathname === "/api/debug/analysis-exists" ||
+    pathname === "/api/debug/entitlement"
+  );
+}
+
+/* -------------------------------- middleware ------------------------------- */
+
+export async function middleware(req) {
+  const { pathname } = req.nextUrl;
+
+  // Hard bypass (no auth)
+  if (isHardBypass(pathname)) return NextResponse.next();
 
   // Always allow public paths and public APIs
   if (isPublicPath(pathname)) return NextResponse.next();
@@ -104,9 +112,8 @@ export async function middleware(req) {
   }
 
   // If not protected, allow
-  if (!isProtectedApi(pathname) && !isProtectedApp(pathname) && !isDualAuthApi(pathname)) {
-    return NextResponse.next();
-  }
+  const needsAuth = isProtectedApi(pathname) || isProtectedApp(pathname) || isDualAuthApi(pathname);
+  if (!needsAuth) return NextResponse.next();
 
   // Supabase session auth
   const res = NextResponse.next();
