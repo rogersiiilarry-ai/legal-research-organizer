@@ -14,7 +14,7 @@ function json(status: number, payload: any) {
     status,
     headers: {
       "Cache-Control": "no-store",
-      "x-token-route": "purchase-token-v3-rest-analyses",
+      "x-token-route": "purchase-token-v4-rest-analyses-owner",
     },
   });
 }
@@ -73,10 +73,14 @@ async function requireUserCookie() {
  * IMPORTANT:
  * Your Supabase JS client cannot currently see the analysis row (schema/view mismatch),
  * but PostgREST can. So we validate existence/ownership via PostgREST.
+ *
+ * NOTE: PostgREST "analyses" exposes owner_id (not user_id).
  */
-async function fetchAnalysisViaRest(analysisId: string): Promise<{ id: string; user_id: string | null } | null> {
+async function fetchAnalysisViaRest(
+  analysisId: string
+): Promise<{ id: string; owner_id: string | null } | null> {
   const base = mustEnv("NEXT_PUBLIC_SUPABASE_URL").replace(/\/$/, "");
-  const url = `${base}/rest/v1/analyses?select=id,user_id&id=eq.${encodeURIComponent(analysisId)}&limit=1`;
+  const url = `${base}/rest/v1/analyses?select=id,owner_id&id=eq.${encodeURIComponent(analysisId)}&limit=1`;
 
   const srk = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
 
@@ -100,7 +104,7 @@ async function fetchAnalysisViaRest(analysisId: string): Promise<{ id: string; u
 
   return {
     id: String(rows[0]?.id || "").trim(),
-    user_id: rows[0]?.user_id ? String(rows[0].user_id).trim() : null,
+    owner_id: rows[0]?.owner_id ? String(rows[0].owner_id).trim() : null,
   };
 }
 
@@ -125,7 +129,8 @@ export async function POST(req: Request) {
     const analysis = await fetchAnalysisViaRest(analysisId);
     if (!analysis?.id) return json(404, { ok: false, error: "Analysis not found" });
 
-    if (user && analysis.user_id && analysis.user_id !== user.id) {
+    // If a real logged-in user is requesting a token, enforce ownership
+    if (user && analysis.owner_id && analysis.owner_id !== user.id) {
       return json(403, { ok: false, error: "Forbidden" });
     }
 
