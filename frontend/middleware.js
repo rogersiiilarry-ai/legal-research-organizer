@@ -1,4 +1,5 @@
-﻿import { NextResponse } from "next/server";
+﻿// frontend/middleware.js
+import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
 function mustEnv(name) {
@@ -32,7 +33,7 @@ function isDualAuthApi(pathname) {
   //  - system secret (x-ingest-secret) for internal automation
   //  - user cookie auth for normal logged-in users
   if (pathname === "/api/search") return true;
-  if (pathname === "/api/research") return true; // ✅ FIX: allow research route to be reached
+  if (pathname === "/api/research") return true;
   if (pathname.startsWith("/api/resolve/")) return true;
   if (pathname.startsWith("/api/audit/run/materialize")) return true;
   if (pathname.startsWith("/api/documents/") && pathname.endsWith("/materialize")) return true;
@@ -68,6 +69,13 @@ function checkSystemSecret(req) {
 
 export async function middleware(req) {
   const { pathname } = req.nextUrl;
+
+  // -------------------------------------------------------------------
+  // HARD BYPASS: these must be reachable without Supabase cookie auth
+  // -------------------------------------------------------------------
+  if (pathname === "/api/purchase/token" || pathname === "/api/stripe/webhook") {
+    return NextResponse.next();
+  }
 
   // Always allow public paths and public APIs
   if (isPublicPath(pathname)) return NextResponse.next();
