@@ -32,6 +32,7 @@ function isDualAuthApi(pathname) {
   //  - system secret (x-ingest-secret) for internal automation
   //  - user cookie auth for normal logged-in users
   if (pathname === "/api/search") return true;
+  if (pathname === "/api/research") return true; // ✅ FIX: allow research route to be reached
   if (pathname.startsWith("/api/resolve/")) return true;
   if (pathname.startsWith("/api/audit/run/materialize")) return true;
   if (pathname.startsWith("/api/documents/") && pathname.endsWith("/materialize")) return true;
