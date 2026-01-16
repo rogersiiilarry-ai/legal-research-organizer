@@ -1,7 +1,7 @@
+// frontend/app/api/purchase/token/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
-import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 
 export const runtime = "nodejs";
@@ -14,7 +14,7 @@ function json(status: number, payload: any) {
     status,
     headers: {
       "Cache-Control": "no-store",
-      "x-token-route": "purchase-token-v4-rest-analyses-owner",
+      "x-token-route": "purchase-token-v5-admin-bypass",
     },
   });
 }
@@ -39,14 +39,9 @@ function hasValidIngestSecret(req: Request) {
   return !!want && !!got && got === want;
 }
 
-function supabaseAdmin() {
-  return createClient(
-    mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
-    mustEnv("SUPABASE_SERVICE_ROLE_KEY"),
-    { auth: { persistSession: false } }
-  );
-}
-
+/**
+ * Cookie user (browser). Uses anon key + SSR cookies.
+ */
 async function requireUserCookie() {
   const cookieStore = cookies();
 
@@ -70,19 +65,48 @@ async function requireUserCookie() {
 }
 
 /**
- * IMPORTANT:
- * Your Supabase JS client cannot currently see the analysis row (schema/view mismatch),
- * but PostgREST can. So we validate existence/ownership via PostgREST.
- *
- * NOTE: PostgREST "analyses" exposes owner_id (not user_id).
+ * Fetch profile flags (admin/free_access) via PostgREST using SRK
+ * so it works even if RLS/JS-client views are quirky.
  */
-async function fetchAnalysisViaRest(
-  analysisId: string
-): Promise<{ id: string; owner_id: string | null } | null> {
+async function fetchProfileFlags(userId: string): Promise<{ is_admin: boolean; free_access: boolean; free_tier: string | null }> {
   const base = mustEnv("NEXT_PUBLIC_SUPABASE_URL").replace(/\/$/, "");
-  const url = `${base}/rest/v1/analyses?select=id,owner_id&id=eq.${encodeURIComponent(analysisId)}&limit=1`;
-
   const srk = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  const url = `${base}/rest/v1/profiles?select=is_admin,free_access,free_tier&id=eq.${encodeURIComponent(userId)}&limit=1`;
+
+  const r = await fetch(url, {
+    method: "GET",
+    headers: {
+      apikey: srk,
+      Authorization: `Bearer ${srk}`,
+      "Content-Type": "application/json",
+    },
+    cache: "no-store",
+  });
+
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`PostgREST profiles lookup failed: ${r.status} ${text}`);
+  }
+
+  const rows = (await r.json().catch(() => [])) as any[];
+  const row = Array.isArray(rows) && rows[0] ? rows[0] : null;
+
+  return {
+    is_admin: !!row?.is_admin,
+    free_access: !!row?.free_access,
+    free_tier: row?.free_tier ? String(row.free_tier) : null,
+  };
+}
+
+/**
+ * PostgREST "analyses" exposes owner_id (not user_id).
+ */
+async function fetchAnalysisViaRest(analysisId: string): Promise<{ id: string; owner_id: string | null } | null> {
+  const base = mustEnv("NEXT_PUBLIC_SUPABASE_URL").replace(/\/$/, "");
+  const srk = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  const url = `${base}/rest/v1/analyses?select=id,owner_id&id=eq.${encodeURIComponent(analysisId)}&limit=1`;
 
   const r = await fetch(url, {
     method: "GET",
@@ -108,6 +132,32 @@ async function fetchAnalysisViaRest(
   };
 }
 
+/**
+ * Insert token via PostgREST so we don't depend on JS-client schema visibility.
+ */
+async function insertPurchaseToken(params: { token: string; analysis_id: string; product: string; expires_at: string }) {
+  const base = mustEnv("NEXT_PUBLIC_SUPABASE_URL").replace(/\/$/, "");
+  const srk = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  const url = `${base}/rest/v1/purchase_tokens`;
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: srk,
+      Authorization: `Bearer ${srk}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify(params),
+  });
+
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`PostgREST purchase_tokens insert failed: ${r.status} ${text}`);
+  }
+}
+
 /* --------------------------------- route -------------------------------- */
 
 export async function POST(req: Request) {
@@ -119,34 +169,34 @@ export async function POST(req: Request) {
     if (!analysisId) return json(400, { ok: false, error: "analysisId required" });
 
     const isSystem = hasValidIngestSecret(req);
+
+    // Browser user flow (cookie) OR internal system flow (secret)
     const user = isSystem ? null : await requireUserCookie();
+    if (!isSystem && !user) return json(401, { ok: false, error: "Unauthorized" });
 
-    if (!isSystem && !user) {
-      return json(401, { ok: false, error: "Unauthorized" });
-    }
-
-    // Validate analysis via PostgREST (source of truth in your current setup)
+    // Confirm analysis exists
     const analysis = await fetchAnalysisViaRest(analysisId);
     if (!analysis?.id) return json(404, { ok: false, error: "Analysis not found" });
 
-    // If a real logged-in user is requesting a token, enforce ownership
-    if (user && analysis.owner_id && analysis.owner_id !== user.id) {
-      return json(403, { ok: false, error: "Forbidden" });
-    }
+    // Enforce ownership unless admin/free_access (admins can mint tokens for any analysis)
+    if (user) {
+      const flags = await fetchProfileFlags(user.id);
+      const isPrivileged = flags.is_admin || flags.free_access;
 
-    const admin = supabaseAdmin();
+      if (!isPrivileged && analysis.owner_id && analysis.owner_id !== user.id) {
+        return json(403, { ok: false, error: "Forbidden" });
+      }
+    }
 
     const token = tokenString();
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
 
-    const { error: insErr } = await admin.from("purchase_tokens").insert({
+    await insertPurchaseToken({
       token,
       analysis_id: analysisId,
       product,
       expires_at: expiresAt,
     });
-
-    if (insErr) return json(500, { ok: false, error: insErr.message });
 
     return json(200, {
       ok: true,
