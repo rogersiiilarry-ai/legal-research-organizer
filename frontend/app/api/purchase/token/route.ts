@@ -14,7 +14,7 @@ function json(status: number, payload: any) {
     status,
     headers: {
       "Cache-Control": "no-store",
-      "x-token-route": "purchase-token-v2",
+      "x-token-route": "purchase-token-v3-rest-analyses",
     },
   });
 }
@@ -49,6 +49,7 @@ function supabaseAdmin() {
 
 async function requireUserCookie() {
   const cookieStore = cookies();
+
   const supabase = createServerClient(
     mustEnv("NEXT_PUBLIC_SUPABASE_URL"),
     mustEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
@@ -68,6 +69,41 @@ async function requireUserCookie() {
   return data.user;
 }
 
+/**
+ * IMPORTANT:
+ * Your Supabase JS client cannot currently see the analysis row (schema/view mismatch),
+ * but PostgREST can. So we validate existence/ownership via PostgREST.
+ */
+async function fetchAnalysisViaRest(analysisId: string): Promise<{ id: string; user_id: string | null } | null> {
+  const base = mustEnv("NEXT_PUBLIC_SUPABASE_URL").replace(/\/$/, "");
+  const url = `${base}/rest/v1/analyses?select=id,user_id&id=eq.${encodeURIComponent(analysisId)}&limit=1`;
+
+  const srk = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  const r = await fetch(url, {
+    method: "GET",
+    headers: {
+      apikey: srk,
+      Authorization: `Bearer ${srk}`,
+      "Content-Type": "application/json",
+    },
+    cache: "no-store",
+  });
+
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`PostgREST analyses lookup failed: ${r.status} ${text}`);
+  }
+
+  const rows = (await r.json().catch(() => [])) as any[];
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+
+  return {
+    id: String(rows[0]?.id || "").trim(),
+    user_id: rows[0]?.user_id ? String(rows[0].user_id).trim() : null,
+  };
+}
+
 /* --------------------------------- route -------------------------------- */
 
 export async function POST(req: Request) {
@@ -85,20 +121,15 @@ export async function POST(req: Request) {
       return json(401, { ok: false, error: "Unauthorized" });
     }
 
-    const admin = supabaseAdmin();
-
-    // Ensure analysis exists and (if user-auth) belongs to user
-    const { data: analysis, error: readErr } = await admin
-      .from("analyses")
-      .select("id,user_id")
-      .eq("id", analysisId)
-      .single();
-
-    if (readErr || !analysis) return json(404, { ok: false, error: "Analysis not found" });
+    // Validate analysis via PostgREST (source of truth in your current setup)
+    const analysis = await fetchAnalysisViaRest(analysisId);
+    if (!analysis?.id) return json(404, { ok: false, error: "Analysis not found" });
 
     if (user && analysis.user_id && analysis.user_id !== user.id) {
       return json(403, { ok: false, error: "Forbidden" });
     }
+
+    const admin = supabaseAdmin();
 
     const token = tokenString();
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
@@ -112,7 +143,13 @@ export async function POST(req: Request) {
 
     if (insErr) return json(500, { ok: false, error: insErr.message });
 
-    return json(200, { ok: true, token, expires_at: expiresAt, mode: isSystem ? "system" : "user" });
+    return json(200, {
+      ok: true,
+      token,
+      expires_at: expiresAt,
+      mode: isSystem ? "system" : "user",
+      product,
+    });
   } catch (e: any) {
     return json(500, { ok: false, error: e?.message || "Token create error" });
   }
