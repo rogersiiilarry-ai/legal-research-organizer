@@ -73,7 +73,11 @@ export async function middleware(req) {
   // -------------------------------------------------------------------
   // HARD BYPASS: these must be reachable without Supabase cookie auth
   // -------------------------------------------------------------------
-  if (pathname === "/api/purchase/token" || pathname === "/api/stripe/webhook") {
+  if (
+    pathname === "/api/purchase/token" ||
+    pathname === "/api/stripe/webhook" ||
+    pathname === "/api/debug/supabase"
+  ) {
     return NextResponse.next();
   }
 
