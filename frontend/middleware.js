@@ -71,12 +71,13 @@ export async function middleware(req) {
   const { pathname } = req.nextUrl;
 
   // -------------------------------------------------------------------
-  // HARD BYPASS: these must be reachable without Supabase cookie auth
+  // HARD BYPASS: must be reachable without Supabase cookie auth
   // -------------------------------------------------------------------
   if (
     pathname === "/api/purchase/token" ||
     pathname === "/api/stripe/webhook" ||
-    pathname === "/api/debug/supabase"
+    pathname === "/api/debug/supabase" ||
+    pathname === "/api/debug/analysis-exists"
   ) {
     return NextResponse.next();
   }
